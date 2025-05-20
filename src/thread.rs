@@ -255,10 +255,10 @@ impl Thread {
             _ => return Err(Error::runtime("cannot reset non-finished thread")),
             #[cfg(any(feature = "lua54", feature = "luau"))]
             _ => unsafe {
-                #[cfg(all(feature = "lua54", not(feature = "vendored")))]
+                // #[cfg(all(feature = "lua54", not(feature = "vendored")))]
                 let status = ffi::lua_resetthread(thread_state);
-                #[cfg(all(feature = "lua54", feature = "vendored"))]
-                let status = ffi::lua_closethread(thread_state, lua.state());
+                // #[cfg(all(feature = "lua54", feature = "vendored"))]
+                // let status = ffi::lua_closethread(thread_state, lua.state());
                 #[cfg(feature = "lua54")]
                 if status != ffi::LUA_OK {
                     return Err(pop_error(thread_state, status));
