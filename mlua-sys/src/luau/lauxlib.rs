@@ -3,7 +3,7 @@
 use std::os::raw::{c_char, c_float, c_int, c_void};
 use std::ptr;
 
-use super::lua::{self, lua_CFunction, lua_Number, lua_State, lua_Unsigned, LUA_REGISTRYINDEX};
+use super::lua::{self, lua_CFunction, lua_Integer, lua_Number, lua_State, lua_Unsigned, LUA_REGISTRYINDEX};
 
 #[repr(C)]
 pub struct luaL_Reg {
@@ -33,10 +33,8 @@ extern "C-unwind" {
     pub fn luaL_checkboolean(L: *mut lua_State, narg: c_int) -> c_int;
     pub fn luaL_optboolean(L: *mut lua_State, narg: c_int, def: c_int) -> c_int;
 
-    #[link_name = "luaL_checkinteger"]
-    pub fn luaL_checkinteger_(L: *mut lua_State, narg: c_int) -> c_int;
-    #[link_name = "luaL_optinteger"]
-    pub fn luaL_optinteger_(L: *mut lua_State, narg: c_int, def: c_int) -> c_int;
+    pub fn luaL_checkinteger(L: *mut lua_State, narg: c_int) -> lua_Integer;
+    pub fn luaL_optinteger(L: *mut lua_State, narg: c_int, def: lua_Integer) -> lua_Integer;
     pub fn luaL_checkunsigned(L: *mut lua_State, narg: c_int) -> lua_Unsigned;
     pub fn luaL_optunsigned(L: *mut lua_State, narg: c_int, def: lua_Unsigned) -> lua_Unsigned;
 
@@ -71,16 +69,9 @@ extern "C-unwind" {
 
     pub fn luaL_newstate() -> *mut lua_State;
 
-    pub fn luaL_findtable(
-        L: *mut lua_State,
-        idx: c_int,
-        fname: *const c_char,
-        szhint: c_int,
-    ) -> *const c_char;
+    // TODO: luaL_findtable
 
     pub fn luaL_typename(L: *mut lua_State, idx: c_int) -> *const c_char;
-
-    pub fn luaL_callyieldable(L: *mut lua_State, nargs: c_int, nresults: c_int) -> c_int;
 
     // sandbox libraries and globals
     #[link_name = "luaL_sandbox"]
@@ -150,7 +141,7 @@ pub unsafe fn luaL_sandbox(L: *mut lua_State, enabled: c_int) {
     }
 
     // set all builtin metatables to read-only
-    lua_pushliteral(L, c"");
+    lua_pushliteral(L, "");
     if lua_getmetatable(L, -1) != 0 {
         lua_setreadonly(L, -1, enabled);
         lua_pop(L, 2);

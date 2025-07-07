@@ -354,7 +354,7 @@ unsafe fn init_userdata_metatable_index(state: *mut ffi::lua_State) -> Result<()
         end
     "#;
     protect_lua!(state, 0, 1, |state| {
-        let ret = ffi::luaL_loadbuffer(state, code.as_ptr(), code.count_bytes(), cstr!("__mlua_index"));
+        let ret = ffi::luaL_loadbuffer(state, code.as_ptr(), code.count_bytes(), cstr!("=__mlua_index"));
         if ret != ffi::LUA_OK {
             ffi::lua_error(state);
         }
@@ -405,7 +405,8 @@ unsafe fn init_userdata_metatable_newindex(state: *mut ffi::lua_State) -> Result
         end
     "#;
     protect_lua!(state, 0, 1, |state| {
-        let ret = ffi::luaL_loadbuffer(state, code.as_ptr(), code.count_bytes(), cstr!("__mlua_newindex"));
+        let code_len = code.count_bytes();
+        let ret = ffi::luaL_loadbuffer(state, code.as_ptr(), code_len, cstr!("=__mlua_newindex"));
         if ret != ffi::LUA_OK {
             ffi::lua_error(state);
         }
@@ -436,18 +437,8 @@ pub(crate) unsafe extern "C-unwind" fn collect_userdata<T>(state: *mut ffi::lua_
 
 // This method is called by Luau GC when it's time to collect the userdata.
 #[cfg(feature = "luau")]
-pub(crate) unsafe extern "C" fn collect_userdata<T>(
-    state: *mut ffi::lua_State,
-    ud: *mut std::os::raw::c_void,
-) {
-    // Almost none Lua operations are allowed when destructor is running,
-    // so we need to set a flag to prevent calling any Lua functions
-    let extra = (*ffi::lua_callbacks(state)).userdata as *mut crate::state::ExtraData;
-    (*extra).running_userdata_gc = true;
-    // Luau does not support _any_ panics in destructors (they are declared as "C", NOT as "C-unwind"),
-    // so any panics will trigger `abort()`.
+pub(crate) unsafe extern "C-unwind" fn collect_userdata<T>(ud: *mut std::os::raw::c_void) {
     ptr::drop_in_place(ud as *mut T);
-    (*extra).running_userdata_gc = false;
 }
 
 // This method can be called by user or Lua GC to destroy the userdata.

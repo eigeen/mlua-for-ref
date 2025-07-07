@@ -1,6 +1,5 @@
 //! Contains definitions from `lua.h`.
 
-use std::ffi::CStr;
 use std::marker::{PhantomData, PhantomPinned};
 use std::os::raw::{c_char, c_double, c_float, c_int, c_uint, c_void};
 use std::{mem, ptr};
@@ -70,11 +69,8 @@ pub const LUA_MINSTACK: c_int = 20;
 /// A Lua number, usually equivalent to `f64`.
 pub type lua_Number = c_double;
 
-/// A Lua integer, usually equivalent to `i64`
-#[cfg(target_pointer_width = "32")]
-pub type lua_Integer = i32;
-#[cfg(target_pointer_width = "64")]
-pub type lua_Integer = i64;
+/// A Lua integer, equivalent to `i32`.
+pub type lua_Integer = c_int;
 
 /// A Lua unsigned integer, equivalent to `u32`.
 pub type lua_Unsigned = c_uint;
@@ -83,12 +79,13 @@ pub type lua_Unsigned = c_uint;
 pub type lua_CFunction = unsafe extern "C-unwind" fn(L: *mut lua_State) -> c_int;
 pub type lua_Continuation = unsafe extern "C-unwind" fn(L: *mut lua_State, status: c_int) -> c_int;
 
-/// Type for userdata destructor functions (no unwinding).
-pub type lua_Destructor = unsafe extern "C" fn(L: *mut lua_State, *mut c_void);
+/// Type for userdata destructor functions.
+pub type lua_Udestructor = unsafe extern "C-unwind" fn(*mut c_void);
+pub type lua_Destructor = unsafe extern "C-unwind" fn(L: *mut lua_State, *mut c_void);
 
-/// Type for memory-allocation functions (no unwinding).
+/// Type for memory-allocation functions.
 pub type lua_Alloc =
-    unsafe extern "C" fn(ud: *mut c_void, ptr: *mut c_void, osize: usize, nsize: usize) -> *mut c_void;
+    unsafe extern "C-unwind" fn(ud: *mut c_void, ptr: *mut c_void, osize: usize, nsize: usize) -> *mut c_void;
 
 /// Returns Luau release version (eg. `0.xxx`).
 pub const fn luau_version() -> Option<&'static str> {
@@ -139,7 +136,7 @@ extern "C-unwind" {
 
     pub fn lua_tonumberx(L: *mut lua_State, idx: c_int, isnum: *mut c_int) -> lua_Number;
     #[link_name = "lua_tointegerx"]
-    pub fn lua_tointegerx_(L: *mut lua_State, idx: c_int, isnum: *mut c_int) -> c_int;
+    pub fn lua_tointegerx_(L: *mut lua_State, idx: c_int, isnum: *mut c_int) -> lua_Integer;
     pub fn lua_tounsignedx(L: *mut lua_State, idx: c_int, isnum: *mut c_int) -> lua_Unsigned;
     pub fn lua_tovector(L: *mut lua_State, idx: c_int) -> *const c_float;
     pub fn lua_toboolean(L: *mut lua_State, idx: c_int) -> c_int;
@@ -163,8 +160,7 @@ extern "C-unwind" {
     //
     pub fn lua_pushnil(L: *mut lua_State);
     pub fn lua_pushnumber(L: *mut lua_State, n: lua_Number);
-    #[link_name = "lua_pushinteger"]
-    pub fn lua_pushinteger_(L: *mut lua_State, n: c_int);
+    pub fn lua_pushinteger(L: *mut lua_State, n: lua_Integer);
     pub fn lua_pushunsigned(L: *mut lua_State, n: lua_Unsigned);
     #[cfg(not(feature = "luau-vector4"))]
     pub fn lua_pushvector(L: *mut lua_State, x: c_float, y: c_float, z: c_float);
@@ -190,7 +186,7 @@ extern "C-unwind" {
     pub fn lua_pushlightuserdatatagged(L: *mut lua_State, p: *mut c_void, tag: c_int);
     pub fn lua_newuserdatatagged(L: *mut lua_State, sz: usize, tag: c_int) -> *mut c_void;
     pub fn lua_newuserdatataggedwithmetatable(L: *mut lua_State, sz: usize, tag: c_int) -> *mut c_void;
-    pub fn lua_newuserdatadtor(L: *mut lua_State, sz: usize, dtor: lua_Destructor) -> *mut c_void;
+    pub fn lua_newuserdatadtor(L: *mut lua_State, sz: usize, dtor: lua_Udestructor) -> *mut c_void;
 
     pub fn lua_newbuffer(L: *mut lua_State, sz: usize) -> *mut c_void;
 
@@ -289,7 +285,7 @@ extern "C-unwind" {
     pub fn lua_setuserdatatag(L: *mut lua_State, idx: c_int, tag: c_int);
     pub fn lua_setuserdatadtor(L: *mut lua_State, tag: c_int, dtor: Option<lua_Destructor>);
     pub fn lua_getuserdatadtor(L: *mut lua_State, tag: c_int) -> Option<lua_Destructor>;
-    pub fn lua_setuserdatametatable(L: *mut lua_State, tag: c_int);
+    pub fn lua_setuserdatametatable(L: *mut lua_State, tag: c_int, idx: c_int);
     pub fn lua_getuserdatametatable(L: *mut lua_State, tag: c_int);
     pub fn lua_setlightuserdataname(L: *mut lua_State, tag: c_int, name: *const c_char);
     pub fn lua_getlightuserdataname(L: *mut lua_State, tag: c_int) -> *const c_char;
@@ -314,13 +310,13 @@ extern "C-unwind" {
 //
 
 #[inline(always)]
-pub unsafe fn lua_tonumber(L: *mut lua_State, idx: c_int) -> lua_Number {
-    lua_tonumberx(L, idx, ptr::null_mut())
+pub unsafe fn lua_tonumber(L: *mut lua_State, i: c_int) -> lua_Number {
+    lua_tonumberx(L, i, ptr::null_mut())
 }
 
 #[inline(always)]
-pub unsafe fn lua_tointeger_(L: *mut lua_State, idx: c_int) -> c_int {
-    lua_tointegerx_(L, idx, ptr::null_mut())
+pub unsafe fn lua_tointeger_(L: *mut lua_State, i: c_int) -> lua_Integer {
+    lua_tointegerx_(L, i, ptr::null_mut())
 }
 
 #[inline(always)]
@@ -344,14 +340,12 @@ pub unsafe fn lua_newuserdata(L: *mut lua_State, sz: usize) -> *mut c_void {
 }
 
 #[inline(always)]
-pub unsafe fn lua_newuserdata_t<T>(L: *mut lua_State, data: T) -> *mut T {
-    unsafe extern "C" fn destructor<T>(_: *mut lua_State, ud: *mut c_void) {
+pub unsafe fn lua_newuserdata_t<T>(L: *mut lua_State) -> *mut T {
+    unsafe extern "C-unwind" fn destructor<T>(ud: *mut c_void) {
         ptr::drop_in_place(ud as *mut T);
     }
 
-    let ud_ptr = lua_newuserdatadtor(L, const { mem::size_of::<T>() }, destructor::<T>) as *mut T;
-    ptr::write(ud_ptr, data);
-    ud_ptr
+    lua_newuserdatadtor(L, mem::size_of::<T>(), destructor::<T>) as *mut T
 }
 
 // TODO: lua_strlen
@@ -407,8 +401,10 @@ pub unsafe fn lua_isnoneornil(L: *mut lua_State, n: c_int) -> c_int {
 }
 
 #[inline(always)]
-pub unsafe fn lua_pushliteral(L: *mut lua_State, s: &'static CStr) {
-    lua_pushstring_(L, s.as_ptr());
+pub unsafe fn lua_pushliteral(L: *mut lua_State, s: &'static str) {
+    use std::ffi::CString;
+    let c_str = CString::new(s).unwrap();
+    lua_pushlstring_(L, c_str.as_ptr(), c_str.as_bytes().len())
 }
 
 #[inline(always)]

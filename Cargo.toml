@@ -1,6 +1,6 @@
 [package]
 name = "mlua"
-version = "0.10.4" # remember to update mlua_derive
+version = "0.10.5" # remember to update mlua_derive
 authors = ["Aleksandr Orlenko <zxteam@pm.me>", "kyren <catherine@kyju.org>"]
 rust-version = "1.79.0"
 edition = "2021"
@@ -36,7 +36,7 @@ luau = ["ffi/luau", "dep:libloading"]
 luau-jit = ["luau", "ffi/luau-codegen"]
 luau-vector4 = ["luau", "ffi/luau-vector4"]
 vendored = ["ffi/vendored"]
-module = ["dep:mlua_derive", "ffi/module"]
+module = ["mlua_derive", "ffi/module"]
 async = ["dep:futures-util"]
 send = ["parking_lot/send_guard", "error-send"]
 error-send = []
@@ -59,7 +59,7 @@ parking_lot = { version = "0.12", features = ["arc_lock"] }
 anyhow = { version = "1.0", optional = true }
 rustversion = "1.0"
 
-ffi = { package = "mlua-sys", version = "0.7.0", path = "mlua-sys" }
+ffi = { package = "mlua-sys", version = "0.6.8", path = "mlua-sys" }
 
 [target.'cfg(unix)'.dependencies]
 libloading = { version = "0.8", optional = true }

@@ -1,6 +1,5 @@
 //! Contains definitions from `lua.h`.
 
-use std::ffi::CStr;
 use std::marker::{PhantomData, PhantomPinned};
 use std::os::raw::{c_char, c_double, c_int, c_uchar, c_void};
 use std::{mem, ptr};
@@ -96,10 +95,10 @@ pub type lua_Reader =
 pub type lua_Writer =
     unsafe extern "C-unwind" fn(L: *mut lua_State, p: *const c_void, sz: usize, ud: *mut c_void) -> c_int;
 
-/// Type for memory-allocation functions (no unwinding)
+/// Type for memory-allocation functions
 #[rustfmt::skip]
 pub type lua_Alloc =
-    unsafe extern "C" fn(ud: *mut c_void, ptr: *mut c_void, osize: usize, nsize: usize) -> *mut c_void;
+    unsafe extern "C-unwind" fn(ud: *mut c_void, ptr: *mut c_void, osize: usize, nsize: usize) -> *mut c_void;
 
 #[cfg_attr(all(windows, raw_dylib), link(name = "lua53", kind = "raw-dylib"))]
 extern "C-unwind" {
@@ -408,8 +407,10 @@ pub unsafe fn lua_isnoneornil(L: *mut lua_State, n: c_int) -> c_int {
 }
 
 #[inline(always)]
-pub unsafe fn lua_pushliteral(L: *mut lua_State, s: &'static CStr) {
-    lua_pushstring(L, s.as_ptr());
+pub unsafe fn lua_pushliteral(L: *mut lua_State, s: &'static str) -> *const c_char {
+    use std::ffi::CString;
+    let c_str = CString::new(s).unwrap();
+    lua_pushlstring(L, c_str.as_ptr(), c_str.as_bytes().len())
 }
 
 #[inline(always)]
