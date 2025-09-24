@@ -627,7 +627,7 @@ fn test_from_value_with_options() -> Result<(), Box<dyn StdError>> {
     // Allow unsupported types
     let value = Value::Function(lua.create_function(|_, ()| Ok(()))?);
     let options = DeserializeOptions::new().deny_unsupported_types(false);
-    assert_eq!(lua.from_value_with::<()>(value, options)?, ());
+    lua.from_value_with::<()>(value, options)?;
 
     // Allow unsupported types (in a table seq)
     let value = lua.load(r#"{"a", "b", function() end, "c"}"#).eval()?;
