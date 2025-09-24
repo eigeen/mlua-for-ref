@@ -97,7 +97,7 @@ fn test_string_fmt_debug() -> Result<()> {
 
     // Invalid utf8
     let s = lua.create_string(b"hello\0world\r\n\t\xf0\x90\x80")?;
-    assert_eq!(format!("{s:?}"), r#"b"hello\0world\r\n\t\xf0\x90\x80""#);
+    assert_eq!(format!("{s:?}"), r#"b"hello\0world\r\n\t\xF0\x90\x80""#);
 
     Ok(())
 }
