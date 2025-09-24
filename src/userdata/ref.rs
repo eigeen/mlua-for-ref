@@ -1,4 +1,4 @@
-use std::any::TypeId;
+use std::any::{type_name, TypeId};
 use std::ops::{Deref, DerefMut};
 use std::os::raw::c_int;
 use std::{fmt, mem};
@@ -7,7 +7,7 @@ use crate::error::{Error, Result};
 use crate::state::{Lua, RawLua};
 use crate::traits::FromLua;
 use crate::userdata::AnyUserData;
-use crate::util::{get_userdata, short_type_name};
+use crate::util::get_userdata;
 use crate::value::Value;
 
 use super::cell::{UserDataStorage, UserDataVariant};
@@ -63,7 +63,7 @@ impl<T> TryFrom<UserDataVariant<T>> for UserDataRef<T> {
 
     #[inline]
     fn try_from(variant: UserDataVariant<T>) -> Result<Self> {
-        let guard = if !cfg!(feature = "send") || is_sync::<T>() {
+        let guard = if cfg!(not(feature = "send")) || is_sync::<T>() {
             variant.raw_lock().try_lock_shared_guarded()
         } else {
             variant.raw_lock().try_lock_exclusive_guarded()
@@ -449,7 +449,7 @@ fn try_value_to_userdata<T>(value: Value) -> Result<AnyUserData> {
         _ => Err(Error::FromLuaConversionError {
             from: value.type_name(),
             to: "userdata".to_string(),
-            message: Some(format!("expected userdata of type {}", short_type_name::<T>())),
+            message: Some(format!("expected userdata of type {}", type_name::<T>())),
         }),
     }
 }

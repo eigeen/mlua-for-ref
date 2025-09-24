@@ -3,13 +3,12 @@ use std::collections::HashMap;
 use std::iter::FromIterator;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::string::String as StdString;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::{error, f32, f64, fmt};
 
 use mlua::{
-    ChunkMode, Error, ExternalError, Function, Lua, LuaOptions, Nil, Result, StdLib, String, Table, UserData,
-    Value, Variadic,
+    ffi, ChunkMode, Error, ExternalError, Function, Lua, LuaOptions, Nil, Result, StdLib, String, Table,
+    UserData, Value, Variadic,
 };
 
 #[test]
@@ -143,6 +142,31 @@ fn test_eval() -> Result<()> {
             ..
         }) => {}
         r => panic!("expected SyntaxError with incomplete_input=true, got {:?}", r),
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_replace_globals() -> Result<()> {
+    let lua = Lua::new();
+
+    let globals = lua.create_table()?;
+    globals.set("foo", "bar")?;
+
+    lua.set_globals(globals.clone())?;
+    let val = lua.load("return foo").eval::<StdString>()?;
+    assert_eq!(val, "bar");
+
+    // Updating globals in sandboxed Lua state is not allowed
+    #[cfg(feature = "luau")]
+    {
+        lua.sandbox(true)?;
+        match lua.set_globals(globals) {
+            Err(Error::RuntimeError(msg))
+                if msg.contains("cannot change globals in a sandboxed Lua state") => {}
+            r => panic!("expected RuntimeError(...) with a specific error message, got {r:?}"),
+        }
     }
 
     Ok(())
@@ -501,6 +525,29 @@ fn test_panic() -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn test_safe_integers() -> Result<()> {
+    const MAX_SAFE_INTEGER: i64 = 2i64.pow(53) - 1;
+    const MIN_SAFE_INTEGER: i64 = -2i64.pow(53) + 1;
+
+    let lua = Lua::new();
+    let f = lua.load("return ...").into_function()?;
+
+    assert_eq!(f.call::<i64>(MAX_SAFE_INTEGER)?, MAX_SAFE_INTEGER);
+    assert_eq!(f.call::<i64>(MIN_SAFE_INTEGER)?, MIN_SAFE_INTEGER);
+
+    // For Lua versions that does not support 64-bit integers, the values will be converted to f64
+    #[cfg(any(feature = "luau", feature = "lua51", feature = "luajit"))]
+    {
+        assert_ne!(f.call::<i64>(MAX_SAFE_INTEGER + 2)?, MAX_SAFE_INTEGER + 2);
+        assert_ne!(f.call::<i64>(MIN_SAFE_INTEGER - 2)?, MIN_SAFE_INTEGER - 2);
+        assert_eq!(f.call::<f64>(i64::MAX)?, i64::MAX as f64);
+    }
+
+    Ok(())
+}
+
 #[test]
 fn test_num_conversion() -> Result<()> {
     let lua = Lua::new();
@@ -554,6 +601,21 @@ fn test_num_conversion() -> Result<()> {
     assert_eq!(lua.unpack::<f32>(lua.pack(f64::MIN)?)?, f32::NEG_INFINITY);
 
     assert_eq!(lua.unpack::<i128>(lua.pack(1i128 << 64)?)?, 1i128 << 64);
+
+    // Negative zero
+    let negative_zero = lua.load("-0.0").eval::<f64>()?;
+    assert_eq!(negative_zero, 0.0);
+    // LuaJIT treats -0.0 as a positive zero
+    #[cfg(not(feature = "luajit"))]
+    assert!(negative_zero.is_sign_negative());
+
+    // In Lua <5.3 all numbers are floats
+    #[cfg(not(any(feature = "lua54", feature = "lua53", feature = "luajit")))]
+    {
+        let negative_zero = lua.load("-0").eval::<f64>()?;
+        assert_eq!(negative_zero, 0.0);
+        assert!(negative_zero.is_sign_negative());
+    }
 
     Ok(())
 }
@@ -922,9 +984,11 @@ fn test_rust_function() -> Result<()> {
 fn test_c_function() -> Result<()> {
     let lua = Lua::new();
 
-    unsafe extern "C-unwind" fn c_function(state: *mut mlua::lua_State) -> std::os::raw::c_int {
-        ffi::lua_pushboolean(state, 1);
-        ffi::lua_setglobal(state, b"c_function\0" as *const _ as *const _);
+    extern "C-unwind" fn c_function(state: *mut mlua::lua_State) -> std::os::raw::c_int {
+        unsafe {
+            ffi::lua_pushboolean(state, 1);
+            ffi::lua_setglobal(state, b"c_function\0" as *const _ as *const _);
+        }
         0
     }
 
@@ -1145,36 +1209,90 @@ fn test_jit_version() -> Result<()> {
 }
 
 #[test]
-fn test_load_from_function() -> Result<()> {
+fn test_register_module() -> Result<()> {
     let lua = Lua::new();
 
-    let i = Arc::new(AtomicU32::new(0));
-    let i2 = i.clone();
-    let func = lua.create_function(move |lua, modname: String| {
-        i2.fetch_add(1, Ordering::Relaxed);
+    let t = lua.create_table()?;
+    t.set("name", "my_module")?;
+    lua.register_module("@my_module", &t)?;
+
+    lua.load(
+        r#"
+        local my_module = require("@my_module")
+        assert(my_module.name == "my_module")
+    "#,
+    )
+    .exec()?;
+
+    lua.unload_module("@my_module")?;
+    lua.load(
+        r#"
+        local ok, err = pcall(function() return require("@my_module") end)
+        assert(not ok)
+        "#,
+    )
+    .exec()?;
+
+    #[cfg(feature = "luau")]
+    {
+        // Luau registered modules must have '@' prefix
+        let res = lua.register_module("my_module", 123);
+        assert!(res.is_err());
+        assert_eq!(
+            res.unwrap_err().to_string(),
+            "runtime error: module name must begin with '@'"
+        );
+
+        // Luau registered modules (aliases) are case-insensitive
+        let res = lua.register_module("@My_Module", &t);
+        assert!(res.is_ok());
+        lua.load(
+            r#"
+            local my_module = require("@MY_MODule")
+            assert(my_module.name == "my_module")
+        "#,
+        )
+        .exec()?;
+    }
+
+    Ok(())
+}
+
+#[test]
+#[cfg(not(feature = "luau"))]
+fn test_preload_module() -> Result<()> {
+    let lua = Lua::new();
+
+    let loader = lua.create_function(move |lua, modname: String| {
         let t = lua.create_table()?;
-        t.set("__name", modname)?;
+        t.set("name", modname)?;
         Ok(t)
     })?;
 
-    let t: Table = lua.load_from_function("my_module", func.clone())?;
-    assert_eq!(t.get::<String>("__name")?, "my_module");
-    assert_eq!(i.load(Ordering::Relaxed), 1);
-
-    let _: Value = lua.load_from_function("my_module", func.clone())?;
-    assert_eq!(i.load(Ordering::Relaxed), 1);
-
-    let func_nil = lua.create_function(move |_, _: String| Ok(Value::Nil))?;
-    let v: Value = lua.load_from_function("my_module2", func_nil)?;
-    assert_eq!(v, Value::Boolean(true));
+    lua.preload_module("@my_module", loader.clone())?;
+    lua.load(
+        r#"
+        -- `my_module` is global for purposes of next test
+        my_module = require("@my_module")
+        assert(my_module.name == "@my_module")
+        local my_module2 = require("@my_module")
+        assert(my_module == my_module2)
+    "#,
+    )
+    .exec()
+    .unwrap();
 
     // Test unloading and loading again
-    lua.unload("my_module")?;
-    let _: Value = lua.load_from_function("my_module", func)?;
-    assert_eq!(i.load(Ordering::Relaxed), 2);
-
-    // Unloading nonexistent module must not fail
-    lua.unload("my_module2")?;
+    lua.unload_module("@my_module")?;
+    lua.load(
+        r#"
+        local my_module3 = require("@my_module")
+        -- `my_module` is not equal to `my_module3` because it was reloaded
+        assert(my_module ~= my_module3)
+        "#,
+    )
+    .exec()
+    .unwrap();
 
     Ok(())
 }
@@ -1184,14 +1302,18 @@ fn test_inspect_stack() -> Result<()> {
     let lua = Lua::new();
 
     // Not inside any function
-    assert!(lua.inspect_stack(0).is_none());
+    assert!(lua.inspect_stack(0, |_| ()).is_none());
 
     let logline = lua.create_function(|lua, msg: StdString| {
-        let debug = lua.inspect_stack(1).unwrap(); // caller
-        let source = debug.source().short_src;
-        let source = source.as_deref().unwrap_or("?");
-        let line = debug.curr_line();
-        Ok(format!("{}:{} {}", source, line, msg))
+        let r = lua
+            .inspect_stack(1, |debug| {
+                let source = debug.source().short_src;
+                let source = source.as_deref().unwrap_or("?");
+                let line = debug.current_line().unwrap();
+                format!("{}:{} {}", source, line, msg)
+            })
+            .unwrap();
+        Ok(r)
     })?;
     lua.globals().set("logline", logline)?;
 
@@ -1214,8 +1336,7 @@ fn test_inspect_stack() -> Result<()> {
     .exec()?;
 
     let stack_info = lua.create_function(|lua, ()| {
-        let debug = lua.inspect_stack(1).unwrap(); // caller
-        let stack_info = debug.stack();
+        let stack_info = lua.inspect_stack(1, |debug| debug.stack()).unwrap();
         Ok(format!("{stack_info:?}"))
     })?;
     lua.globals().set("stack_info", stack_info)?;
@@ -1241,6 +1362,25 @@ fn test_inspect_stack() -> Result<()> {
             return stack_info()
         end
         assert(baz() == 'DebugStack { num_ups: 1 }')
+    "#,
+    )
+    .exec()?;
+
+    // Test retrieving currently running function
+    let running_function =
+        lua.create_function(|lua, ()| Ok(lua.inspect_stack(1, |debug| debug.function())))?;
+    lua.globals().set("running_function", running_function)?;
+    lua.load(
+        r#"
+        local function baz()
+            return running_function()
+        end
+        if jit == nil then
+            assert(baz() == baz)
+        else
+            -- luajit inline the "baz" function and returns the chunk itself
+            assert(baz() == running_function())
+        end
     "#,
     )
     .exec()?;
@@ -1303,8 +1443,7 @@ fn test_warnings() -> Result<()> {
     lua.set_warning_function(|_, _, _| Err(Error::runtime("warning error")));
     assert!(matches!(
         lua.load(r#"warn("test")"#).exec(),
-        Err(Error::CallbackError { cause, .. })
-            if matches!(*cause, Error::RuntimeError(ref err) if err == "warning error")
+        Err(Error::RuntimeError(ref err)) if err == "warning error"
     ));
 
     // Recursive warning
@@ -1417,6 +1556,26 @@ fn test_gc_drop_ref_thread() -> Result<()> {
         // GC will run eventually to collect the function and the table above
         lua.create_table()?;
     }
+
+    Ok(())
+}
+
+#[cfg(not(feature = "luau"))]
+#[test]
+fn test_get_or_init_from_ptr() -> Result<()> {
+    // This would not work with Luau, the state must be init by mlua internally
+    let state = unsafe { ffi::luaL_newstate() };
+
+    let mut lua = unsafe { Lua::get_or_init_from_ptr(state) };
+    lua.globals().set("hello", "world678")?;
+
+    // The same Lua instance must be returned
+    lua = unsafe { Lua::get_or_init_from_ptr(state) };
+    assert_eq!(lua.globals().get::<String>("hello")?, "world678");
+
+    unsafe { ffi::lua_close(state) };
+
+    // Lua must not be accessed after closing
 
     Ok(())
 }

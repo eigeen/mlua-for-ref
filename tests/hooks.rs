@@ -1,6 +1,5 @@
 #![cfg(not(feature = "luau"))]
 
-use std::ops::Deref;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -25,9 +24,9 @@ fn test_line_counts() -> Result<()> {
     let lua = Lua::new();
     lua.set_hook(HookTriggers::EVERY_LINE, move |_lua, debug| {
         assert_eq!(debug.event(), DebugEvent::Line);
-        hook_output.lock().unwrap().push(debug.curr_line());
+        hook_output.lock().unwrap().push(debug.current_line().unwrap());
         Ok(VmState::Continue)
-    });
+    })?;
     lua.load(
         r#"
             local x = 2 + 3
@@ -62,7 +61,7 @@ fn test_function_calls() -> Result<()> {
         let name = names.name.map(|s| s.into_owned());
         hook_output.lock().unwrap().push((name, source.what));
         Ok(VmState::Continue)
-    });
+    })?;
 
     lua.load(
         r#"
@@ -101,17 +100,13 @@ fn test_error_within_hook() -> Result<()> {
 
     lua.set_hook(HookTriggers::EVERY_LINE, |_lua, _debug| {
         Err(Error::runtime("Something happened in there!"))
-    });
+    })?;
 
     let err = lua.load("x = 1").exec().expect_err("panic didn't propagate");
-
     match err {
-        Error::CallbackError { cause, .. } => match cause.deref() {
-            Error::RuntimeError(s) => assert_eq!(s, "Something happened in there!"),
-            _ => panic!("wrong callback error kind caught"),
-        },
-        _ => panic!("wrong error kind caught"),
-    };
+        Error::RuntimeError(msg) => assert_eq!(msg, "Something happened in there!"),
+        err => panic!("expected `RuntimeError` with a specific message, got {err:?}"),
+    }
 
     Ok(())
 }
@@ -135,7 +130,7 @@ fn test_limit_execution_instructions() -> Result<()> {
                 Ok(VmState::Continue)
             }
         },
-    );
+    )?;
 
     lua.globals().set("x", Value::Integer(0))?;
     let _ = lua
@@ -158,7 +153,7 @@ fn test_hook_removal() -> Result<()> {
 
     lua.set_hook(HookTriggers::new().every_nth_instruction(1), |_lua, _debug| {
         Err(Error::runtime("this hook should've been removed by this time"))
-    });
+    })?;
 
     assert!(lua.load("local x = 1").exec().is_err());
     lua.remove_hook();
@@ -205,10 +200,10 @@ fn test_hook_swap_within_hook() -> Result<()> {
                             });
                             Ok(VmState::Continue)
                         })
-                });
+                })?;
                 Ok(VmState::Continue)
             })
-    });
+    })?;
 
     TL_LUA.with(|tl| {
         let tl = tl.borrow();
@@ -245,9 +240,9 @@ fn test_hook_threads() -> Result<()> {
     let hook_output = output.clone();
     co.set_hook(HookTriggers::EVERY_LINE, move |_lua, debug| {
         assert_eq!(debug.event(), DebugEvent::Line);
-        hook_output.lock().unwrap().push(debug.curr_line());
+        hook_output.lock().unwrap().push(debug.current_line().unwrap());
         Ok(VmState::Continue)
-    });
+    })?;
 
     co.resume::<()>(())?;
     lua.remove_hook();
@@ -277,7 +272,7 @@ fn test_hook_yield() -> Result<()> {
         .into_function()?;
     let co = lua.create_thread(func)?;
 
-    co.set_hook(HookTriggers::EVERY_LINE, move |_lua, _debug| Ok(VmState::Yield));
+    co.set_hook(HookTriggers::EVERY_LINE, move |_lua, _debug| Ok(VmState::Yield))?;
 
     #[cfg(any(feature = "lua54", feature = "lua53"))]
     {
@@ -294,6 +289,39 @@ fn test_hook_yield() -> Result<()> {
         );
         assert!(co.status() == ThreadStatus::Error);
     }
+
+    Ok(())
+}
+
+#[test]
+fn test_global_hook() -> Result<()> {
+    let lua = Lua::new();
+
+    let counter = Arc::new(AtomicI64::new(0));
+    let hook_counter = counter.clone();
+    lua.set_global_hook(HookTriggers::EVERY_LINE, move |_lua, debug| {
+        assert_eq!(debug.event(), DebugEvent::Line);
+        hook_counter.fetch_add(1, Ordering::Relaxed);
+        Ok(VmState::Continue)
+    })?;
+
+    let thread = lua.create_thread(
+        lua.load(
+            r#"
+            local x = 2 + 3
+            local y = x * 63
+            coroutine.yield()
+            local z = string.len(x..", "..y)
+        "#,
+        )
+        .into_function()?,
+    )?;
+
+    thread.resume::<()>(()).unwrap();
+    lua.remove_global_hook();
+    thread.resume::<()>(()).unwrap();
+    assert_eq!(thread.status(), ThreadStatus::Finished);
+    assert_eq!(counter.load(Ordering::Relaxed), 3);
 
     Ok(())
 }

@@ -1,94 +1,19 @@
 #![cfg(feature = "luau")]
 
+use std::cell::Cell;
 use std::fmt::Debug;
-use std::fs;
-use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::os::raw::c_void;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use mlua::{Compiler, Error, Lua, LuaOptions, Result, StdLib, Table, ThreadStatus, Value, Vector, VmState};
+use mlua::{
+    Compiler, Error, Function, Lua, LuaOptions, Result, StdLib, Table, ThreadStatus, Value, Vector, VmState,
+};
 
 #[test]
 fn test_version() -> Result<()> {
     let lua = Lua::new();
     assert!(lua.globals().get::<String>("_VERSION")?.starts_with("Luau 0."));
-    Ok(())
-}
-
-#[test]
-fn test_require() -> Result<()> {
-    // Ensure that require() is not available if package module is not loaded
-    let mut lua = Lua::new_with(StdLib::NONE, LuaOptions::default())?;
-    assert!(lua.globals().get::<Option<Value>>("require")?.is_none());
-    assert!(lua.globals().get::<Option<Value>>("package")?.is_none());
-
-    if cfg!(target_arch = "wasm32") {
-        // TODO: figure out why emscripten fails on file operations
-        // Also see https://github.com/rust-lang/rust/issues/119250
-        return Ok(());
-    }
-
-    lua = Lua::new();
-
-    // Check that require() can load stdlib modules (including `package`)
-    lua.load(
-        r#"
-        local math = require("math")
-        assert(math == _G.math, "math module does not match _G.math")
-        local package = require("package")
-        assert(package == _G.package, "package module does not match _G.package")
-    "#,
-    )
-    .exec()?;
-
-    let temp_dir = tempfile::tempdir().unwrap();
-    fs::write(
-        temp_dir.path().join("module.luau"),
-        r#"
-        counter = (counter or 0) + 1
-        return {
-            counter = counter,
-            error = function() error("test") end,
-        }
-    "#,
-    )?;
-
-    lua.globals()
-        .get::<Table>("package")?
-        .set("path", temp_dir.path().join("?.luau").to_string_lossy())?;
-
-    lua.load(
-        r#"
-        local module = require("module")
-        assert(module.counter == 1)
-        module = require("module")
-        assert(module.counter == 1)
-
-        local ok, err = pcall(module.error)
-        assert(not ok and string.find(err, "module.luau") ~= nil)
-    "#,
-    )
-    .exec()?;
-
-    // Require non-existent module
-    match lua.load("require('non-existent')").exec() {
-        Err(Error::RuntimeError(e)) if e.contains("module 'non-existent' not found") => {}
-        r => panic!("expected RuntimeError(...) with a specific message, got {r:?}"),
-    }
-
-    // Require binary module in safe mode
-    lua.globals()
-        .get::<Table>("package")?
-        .set("cpath", temp_dir.path().join("?.so").to_string_lossy())?;
-    fs::write(temp_dir.path().join("dylib.so"), "")?;
-    match lua.load("require('dylib')").exec() {
-        Err(Error::RuntimeError(e)) if cfg!(unix) && e.contains("module 'dylib' not found") => {
-            assert!(e.contains("dynamic libraries are disabled in safe mode"))
-        }
-        Err(Error::RuntimeError(e)) if e.contains("module 'dylib' not found") => {}
-        r => panic!("expected RuntimeError(...) with a specific message, got {r:?}"),
-    }
-
     Ok(())
 }
 
@@ -194,11 +119,13 @@ fn test_vector_metatable() -> Result<()> {
     "#,
         )
         .eval::<Table>()?;
-    vector_mt.set_metatable(Some(vector_mt.clone()));
+    vector_mt.set_metatable(Some(vector_mt.clone()))?;
     lua.set_type_metatable::<Vector>(Some(vector_mt.clone()));
     lua.globals().set("Vector3", vector_mt)?;
 
-    let compiler = Compiler::new().set_vector_lib("Vector3").set_vector_ctor("new");
+    let compiler = Compiler::new()
+        .set_vector_ctor("Vector3.new")
+        .set_vector_type("Vector3");
 
     // Test vector methods (fastcall)
     lua.load(
@@ -241,9 +168,9 @@ fn test_readonly_table() -> Result<()> {
     check_readonly_error(t.raw_pop::<Value>());
 
     // Special case
-    match catch_unwind(AssertUnwindSafe(|| t.set_metatable(None))) {
-        Ok(_) => panic!("expected panic, got nothing"),
-        Err(_) => {}
+    match t.set_metatable(None) {
+        Err(Error::RuntimeError(e)) if e.contains("attempt to modify a readonly table") => {}
+        r => panic!("expected RuntimeError(...) with a specific message, got {r:?}"),
     }
 
     Ok(())
@@ -270,6 +197,14 @@ fn test_sandbox() -> Result<()> {
     co.sandbox()?;
     assert_eq!(co.resume::<Option<i32>>(())?, Some(123));
 
+    // collectgarbage should be restricted in sandboxed mode
+    let collectgarbage = lua.globals().get::<Function>("collectgarbage")?;
+    for arg in ["collect", "stop", "restart", "step", "isrunning"] {
+        let err = collectgarbage.call::<()>(arg).err().unwrap().to_string();
+        assert!(err.contains("collectgarbage called with invalid option"));
+    }
+    assert!(collectgarbage.call::<u64>("count").unwrap() > 0);
+
     lua.sandbox(false)?;
 
     // Previously set variable `global` should be cleared now
@@ -278,6 +213,11 @@ fn test_sandbox() -> Result<()> {
     // Readonly flags should be cleared as well
     let table = lua.globals().get::<Table>("table")?;
     table.set("test", "test")?;
+
+    // collectgarbage should work now
+    for arg in ["collect", "stop", "restart", "count", "step", "isrunning"] {
+        collectgarbage.call::<()>(arg).unwrap();
+    }
 
     Ok(())
 }
@@ -390,16 +330,22 @@ fn test_interrupts() -> Result<()> {
     assert_eq!(yield_count.load(Ordering::Relaxed), 7);
     assert_eq!(co.status(), ThreadStatus::Finished);
 
+    // Test no yielding at non-yieldable points
+    yield_count.store(0, Ordering::Relaxed);
+    let co = lua.create_thread(lua.create_function(|lua, arg: Value| {
+        (lua.load("return (function(x) return x end)(...)")).call::<Value>(arg)
+    })?)?;
+    let res = co.resume::<String>("abc")?;
+    assert_eq!(res, "abc".to_string());
+    assert_eq!(yield_count.load(Ordering::Relaxed), 3);
+
     //
     // Test errors in interrupts
     //
     lua.set_interrupt(|_| Err(Error::runtime("error from interrupt")));
     match f.call::<()>(()) {
-        Err(Error::CallbackError { cause, .. }) => match *cause {
-            Error::RuntimeError(ref m) if m == "error from interrupt" => {}
-            ref e => panic!("expected RuntimeError with a specific message, got {:?}", e),
-        },
-        r => panic!("expected CallbackError, got {:?}", r),
+        Err(Error::RuntimeError(ref msg)) => assert_eq!(msg, "error from interrupt"),
+        res => panic!("expected `RuntimeError` with a specific message, got {res:?}"),
     }
 
     lua.remove_interrupt();
@@ -412,3 +358,117 @@ fn test_fflags() {
     // We cannot really on any particular feature flag to be present
     assert!(Lua::set_fflag("UnknownFlag", true).is_err());
 }
+
+#[test]
+fn test_thread_events() -> Result<()> {
+    let lua = Lua::new();
+
+    let count = Arc::new(AtomicU64::new(0));
+    let thread_data: Arc<(AtomicPtr<c_void>, AtomicBool)> = Arc::new(Default::default());
+
+    let (count2, thread_data2) = (count.clone(), thread_data.clone());
+    lua.set_thread_creation_callback(move |_, thread| {
+        count2.fetch_add(1, Ordering::Relaxed);
+        (thread_data2.0).store(thread.to_pointer() as *mut _, Ordering::Relaxed);
+        thread_data2.1.store(false, Ordering::Relaxed);
+        Ok(())
+    });
+    let (count3, thread_data3) = (count.clone(), thread_data.clone());
+    lua.set_thread_collection_callback(move |thread_ptr| {
+        count3.fetch_add(1, Ordering::Relaxed);
+        if thread_data3.0.load(Ordering::Relaxed) == thread_ptr.0 {
+            thread_data3.1.store(true, Ordering::Relaxed);
+        }
+    });
+
+    let t = lua.create_thread(lua.load("return 123").into_function()?)?;
+    assert_eq!(count.load(Ordering::Relaxed), 1);
+    let t_ptr = t.to_pointer();
+    assert_eq!(t_ptr, thread_data.0.load(Ordering::Relaxed));
+    assert!(!thread_data.1.load(Ordering::Relaxed));
+
+    // Thead will be destroyed after GC cycle
+    drop(t);
+    lua.gc_collect()?;
+    assert_eq!(count.load(Ordering::Relaxed), 2);
+    assert_eq!(t_ptr, thread_data.0.load(Ordering::Relaxed));
+    assert!(thread_data.1.load(Ordering::Relaxed));
+
+    // Check that recursion is not allowed
+    let count4 = count.clone();
+    lua.set_thread_creation_callback(move |lua, _value| {
+        count4.fetch_add(1, Ordering::Relaxed);
+        let _ = lua.create_thread(lua.load("return 123").into_function().unwrap())?;
+        Ok(())
+    });
+    let t = lua.create_thread(lua.load("return 123").into_function()?)?;
+    assert_eq!(count.load(Ordering::Relaxed), 3);
+
+    lua.remove_thread_callbacks();
+    drop(t);
+    lua.gc_collect()?;
+    assert_eq!(count.load(Ordering::Relaxed), 3);
+
+    // Test error inside callback
+    lua.set_thread_creation_callback(move |_, _| Err(Error::runtime("error when processing thread event")));
+    let result = lua.create_thread(lua.load("return 123").into_function()?);
+    assert!(result.is_err());
+    assert!(
+        matches!(result, Err(Error::RuntimeError(err)) if err.contains("error when processing thread event"))
+    );
+
+    // Test context switch when running Lua script
+    let count = Cell::new(0);
+    lua.set_thread_creation_callback(move |_, _| {
+        count.set(count.get() + 1);
+        if count.get() == 2 {
+            return Err(Error::runtime("thread limit exceeded"));
+        }
+        Ok(())
+    });
+    let result = lua
+        .load(
+            r#"
+            local co = coroutine.wrap(function() return coroutine.create(print) end)
+            co()
+    "#,
+        )
+        .exec();
+    assert!(result.is_err());
+    assert!(matches!(result, Err(Error::RuntimeError(err)) if err.contains("thread limit exceeded")));
+
+    Ok(())
+}
+
+#[test]
+fn test_loadstring() -> Result<()> {
+    let lua = Lua::new();
+
+    let f = lua.load(r#"loadstring("return 123")"#).eval::<Function>()?;
+    assert_eq!(f.call::<i32>(())?, 123);
+
+    let err = lua
+        .load(r#"loadstring("retur 123", "chunk")"#)
+        .exec()
+        .err()
+        .unwrap();
+    assert!(err.to_string().contains(
+        r#"syntax error: [string "chunk"]:1: Incomplete statement: expected assignment or a function call"#
+    ));
+
+    Ok(())
+}
+
+#[test]
+fn test_typeof_error() -> Result<()> {
+    let lua = Lua::new();
+
+    let err = Error::runtime("just a test error");
+    let res = lua.load("return typeof(...)").call::<String>(err)?;
+    assert_eq!(res, "error");
+
+    Ok(())
+}
+
+#[path = "luau/require.rs"]
+mod require;

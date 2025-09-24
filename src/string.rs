@@ -11,7 +11,7 @@ use crate::traits::IntoLua;
 use crate::types::{LuaType, ValueRef};
 use crate::value::Value;
 
-#[cfg(feature = "serialize")]
+#[cfg(feature = "serde")]
 use {
     serde::ser::{Serialize, Serializer},
     std::result::Result as StdResult,
@@ -43,7 +43,7 @@ impl String {
     /// # }
     /// ```
     #[inline]
-    pub fn to_str(&self) -> Result<BorrowedStr> {
+    pub fn to_str(&self) -> Result<BorrowedStr<'_>> {
         BorrowedStr::try_from(self)
     }
 
@@ -86,7 +86,7 @@ impl String {
 
     /// Get the bytes that make up this string.
     ///
-    /// The returned slice will not contain the terminating nul byte, but will contain any nul
+    /// The returned slice will not contain the terminating null byte, but will contain any null
     /// bytes embedded into the Lua string.
     ///
     /// # Examples
@@ -102,19 +102,19 @@ impl String {
     /// # }
     /// ```
     #[inline]
-    pub fn as_bytes(&self) -> BorrowedBytes {
+    pub fn as_bytes(&self) -> BorrowedBytes<'_> {
         BorrowedBytes::from(self)
     }
 
-    /// Get the bytes that make up this string, including the trailing nul byte.
-    pub fn as_bytes_with_nul(&self) -> BorrowedBytes {
+    /// Get the bytes that make up this string, including the trailing null byte.
+    pub fn as_bytes_with_nul(&self) -> BorrowedBytes<'_> {
         let BorrowedBytes { buf, borrow, _lua } = BorrowedBytes::from(self);
-        // Include the trailing nul byte (it's always present but excluded by default)
+        // Include the trailing null byte (it's always present but excluded by default)
         let buf = unsafe { slice::from_raw_parts((*buf).as_ptr(), (*buf).len() + 1) };
         BorrowedBytes { buf, borrow, _lua }
     }
 
-    // Does not return the terminating nul byte
+    // Does not return the terminating null byte
     unsafe fn to_slice(&self) -> (&[u8], Lua) {
         let lua = self.0.lua.upgrade();
         let slice = {
@@ -211,7 +211,7 @@ impl Hash for String {
     }
 }
 
-#[cfg(feature = "serialize")]
+#[cfg(feature = "serde")]
 impl Serialize for String {
     fn serialize<S>(&self, serializer: S) -> StdResult<S::Ok, S::Error>
     where

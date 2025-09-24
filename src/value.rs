@@ -15,7 +15,7 @@ use crate::types::{Integer, LightUserData, Number, ValueRef};
 use crate::userdata::AnyUserData;
 use crate::util::{check_stack, StackGuard};
 
-#[cfg(feature = "serialize")]
+#[cfg(feature = "serde")]
 use {
     crate::table::SerializableTable,
     rustc_hash::FxHashSet,
@@ -272,7 +272,10 @@ impl Value {
     /// If the value is a Lua [`Integer`], try to convert it to `i64` or return `None` otherwise.
     #[inline]
     pub fn as_i64(&self) -> Option<i64> {
-        self.as_integer().map(i64::from)
+        #[cfg(target_pointer_width = "64")]
+        return self.as_integer();
+        #[cfg(not(target_pointer_width = "64"))]
+        return self.as_integer().map(i64::from);
     }
 
     /// Cast the value to `u64`.
@@ -353,14 +356,22 @@ impl Value {
     ///
     /// If the value is a Lua [`String`], try to convert it to [`BorrowedStr`] or return `None`
     /// otherwise.
+    #[deprecated(
+        since = "0.11.0",
+        note = "This method does not follow Rust naming convention. Use `as_string().and_then(|s| s.to_str().ok())` instead."
+    )]
     #[inline]
-    pub fn as_str(&self) -> Option<BorrowedStr> {
+    pub fn as_str(&self) -> Option<BorrowedStr<'_>> {
         self.as_string().and_then(|s| s.to_str().ok())
     }
 
     /// Cast the value to [`StdString`].
     ///
     /// If the value is a Lua [`String`], converts it to [`StdString`] or returns `None` otherwise.
+    #[deprecated(
+        since = "0.11.0",
+        note = "This method does not follow Rust naming convention. Use `as_string().map(|s| s.to_string_lossy())` instead."
+    )]
     #[inline]
     pub fn as_string_lossy(&self) -> Option<StdString> {
         self.as_string().map(|s| s.to_string_lossy())
@@ -478,10 +489,9 @@ impl Value {
     /// Wrap reference to this Value into [`SerializableValue`].
     ///
     /// This allows customizing serialization behavior using serde.
-    #[cfg(feature = "serialize")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "serialize")))]
-    #[doc(hidden)]
-    pub fn to_serializable(&self) -> SerializableValue {
+    #[cfg(feature = "serde")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
+    pub fn to_serializable(&self) -> SerializableValue<'_> {
         SerializableValue::new(self, Default::default(), None)
     }
 
@@ -627,8 +637,8 @@ impl PartialEq for Value {
 }
 
 /// A wrapped [`Value`] with customized serialization behavior.
-#[cfg(feature = "serialize")]
-#[cfg_attr(docsrs, doc(cfg(feature = "serialize")))]
+#[cfg(feature = "serde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
 pub struct SerializableValue<'a> {
     value: &'a Value,
     options: crate::serde::de::Options,
@@ -636,7 +646,7 @@ pub struct SerializableValue<'a> {
     visited: Option<Rc<RefCell<FxHashSet<*const c_void>>>>,
 }
 
-#[cfg(feature = "serialize")]
+#[cfg(feature = "serde")]
 impl Serialize for Value {
     #[inline]
     fn serialize<S: Serializer>(&self, serializer: S) -> StdResult<S::Ok, S::Error> {
@@ -644,7 +654,7 @@ impl Serialize for Value {
     }
 }
 
-#[cfg(feature = "serialize")]
+#[cfg(feature = "serde")]
 impl<'a> SerializableValue<'a> {
     #[inline]
     pub(crate) fn new(
@@ -673,7 +683,7 @@ impl<'a> SerializableValue<'a> {
     ///
     /// Default: **true**
     #[must_use]
-    pub const fn deny_unsupported_types(mut self, enabled: bool) -> Self {
+    pub fn deny_unsupported_types(mut self, enabled: bool) -> Self {
         self.options.deny_unsupported_types = enabled;
         self
     }
@@ -684,7 +694,7 @@ impl<'a> SerializableValue<'a> {
     ///
     /// Default: **true**
     #[must_use]
-    pub const fn deny_recursive_tables(mut self, enabled: bool) -> Self {
+    pub fn deny_recursive_tables(mut self, enabled: bool) -> Self {
         self.options.deny_recursive_tables = enabled;
         self
     }
@@ -693,7 +703,7 @@ impl<'a> SerializableValue<'a> {
     ///
     /// Default: **false**
     #[must_use]
-    pub const fn sort_keys(mut self, enabled: bool) -> Self {
+    pub fn sort_keys(mut self, enabled: bool) -> Self {
         self.options.sort_keys = enabled;
         self
     }
@@ -702,13 +712,24 @@ impl<'a> SerializableValue<'a> {
     ///
     /// Default: **false**
     #[must_use]
-    pub const fn encode_empty_tables_as_array(mut self, enabled: bool) -> Self {
+    pub fn encode_empty_tables_as_array(mut self, enabled: bool) -> Self {
         self.options.encode_empty_tables_as_array = enabled;
+        self
+    }
+
+    /// If true, enable detection of mixed tables.
+    ///
+    /// A mixed table is a table that has both array-like and map-like entries or several borders.
+    ///
+    /// Default: **false**
+    #[must_use]
+    pub fn detect_mixed_tables(mut self, enabled: bool) -> Self {
+        self.options.detect_mixed_tables = enabled;
         self
     }
 }
 
-#[cfg(feature = "serialize")]
+#[cfg(feature = "serde")]
 impl Serialize for SerializableValue<'_> {
     fn serialize<S>(&self, serializer: S) -> StdResult<S::Ok, S::Error>
     where

@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use mlua::{
     AnyUserData, Error, ExternalError, Function, Lua, MetaMethod, Nil, ObjectLike, Result, String, UserData,
-    UserDataFields, UserDataMethods, UserDataRef, Value, Variadic,
+    UserDataFields, UserDataMethods, UserDataRef, UserDataRegistry, Value, Variadic,
 };
 
 #[test]
@@ -38,7 +38,7 @@ fn test_userdata() -> Result<()> {
 
 #[test]
 fn test_methods() -> Result<()> {
-    #[cfg_attr(feature = "serialize", derive(serde::Serialize))]
+    #[cfg_attr(feature = "serde", derive(serde::Serialize))]
     struct MyUserData(i64);
 
     impl UserData for MyUserData {
@@ -81,7 +81,7 @@ fn test_methods() -> Result<()> {
     check_methods(&lua, lua.create_userdata(MyUserData(42))?)?;
 
     // Additionally check serializable userdata
-    #[cfg(feature = "serialize")]
+    #[cfg(feature = "serde")]
     check_methods(&lua, lua.create_ser_userdata(MyUserData(42))?)?;
 
     Ok(())
@@ -306,7 +306,7 @@ fn test_userdata_take() -> Result<()> {
         }
     }
 
-    #[cfg(feature = "serialize")]
+    #[cfg(feature = "serde")]
     impl serde::Serialize for MyUserdata {
         fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
         where
@@ -364,7 +364,7 @@ fn test_userdata_take() -> Result<()> {
     check_userdata_take(&lua, userdata, rc)?;
 
     // Additionally check serializable userdata
-    #[cfg(feature = "serialize")]
+    #[cfg(feature = "serde")]
     {
         let rc = Arc::new(18);
         let userdata = lua.create_ser_userdata(MyUserdata(rc.clone()))?;
@@ -525,6 +525,11 @@ fn test_fields() -> Result<()> {
                 Ok(())
             });
 
+            // Field that emulates method
+            fields.add_field_function_get("val_fget", |lua, ud| {
+                lua.create_function(move |_, ()| Ok(ud.borrow::<MyUserData>()?.0))
+            });
+
             // Use userdata "uservalue" storage
             fields.add_field_function_get("uval", |_, ud| ud.user_value::<Option<String>>());
             fields.add_field_function_set("uval", |_, ud, s: Option<String>| ud.set_user_value(s));
@@ -537,6 +542,10 @@ fn test_fields() -> Result<()> {
                 })
             })
         }
+
+        fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+            methods.add_method("dummy", |_, _, ()| Ok(()));
+        }
     }
 
     globals.set("ud", MyUserData(7))?;
@@ -546,6 +555,7 @@ fn test_fields() -> Result<()> {
         assert(ud.val == 7)
         ud.val = 10
         assert(ud.val == 10)
+        assert(ud:val_fget() == 10)
 
         assert(ud.uval == nil)
         ud.uval = "hello"
@@ -1294,6 +1304,61 @@ fn test_userdata_wrappers() -> Result<()> {
         assert_eq!(ud.0, 20);
         drop(ud);
     }
+
+    Ok(())
+}
+
+#[cfg(feature = "luau")]
+#[test]
+fn test_userdata_namecall() -> Result<()> {
+    let lua = Lua::new();
+
+    struct MyUserData;
+
+    impl UserData for MyUserData {
+        fn register(registry: &mut mlua::UserDataRegistry<Self>) {
+            registry.add_method("method", |_, _, ()| Ok("method called"));
+            registry.add_field_method_get("field", |_, _| Ok("field value"));
+
+            registry.add_meta_method(MetaMethod::Index, |_, _, key: StdString| Ok(key));
+
+            registry.enable_namecall();
+        }
+    }
+
+    let ud = lua.create_userdata(MyUserData)?;
+    lua.globals().set("ud", &ud)?;
+    lua.load(
+        r#"
+        assert(ud:method() == "method called")
+        assert(ud.field == "field value")
+        assert(ud.dynamic_field == "dynamic_field")
+        local ok, err = pcall(function() return ud:dynamic_field() end)
+        assert(tostring(err):find("attempt to call an unknown method 'dynamic_field'") ~= nil)
+        "#,
+    )
+    .exec()?;
+
+    ud.destroy()?;
+    let err = lua.load("ud:method()").exec().unwrap_err();
+    assert!(err.to_string().contains("userdata has been destructed"));
+
+    Ok(())
+}
+
+#[test]
+fn test_userdata_get_path() -> Result<()> {
+    let lua = Lua::new();
+
+    struct MyUd;
+    impl UserData for MyUd {
+        fn register(registry: &mut UserDataRegistry<Self>) {
+            registry.add_field("value", "userdata_value");
+        }
+    }
+
+    let ud = lua.create_userdata(MyUd)?;
+    assert_eq!(ud.get_path::<String>(".value")?, "userdata_value");
 
     Ok(())
 }

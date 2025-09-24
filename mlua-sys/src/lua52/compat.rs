@@ -51,7 +51,8 @@ pub unsafe fn lua_isinteger(L: *mut lua_State, idx: c_int) -> c_int {
     if lua_type(L, idx) == LUA_TNUMBER {
         let n = lua_tonumber(L, idx);
         let i = lua_tointeger(L, idx);
-        if (n - i as lua_Number).abs() < lua_Number::EPSILON {
+        // Lua 5.3+ returns "false" for `-0.0`
+        if n.to_bits() == (i as lua_Number).to_bits() {
             return 1;
         }
     }
@@ -199,16 +200,16 @@ pub unsafe fn luaL_tolstring(L: *mut lua_State, mut idx: c_int, len: *mut usize)
     if luaL_callmeta(L, idx, cstr!("__tostring")) == 0 {
         match lua_type(L, idx) {
             LUA_TNIL => {
-                lua_pushliteral(L, "nil");
+                lua_pushliteral(L, c"nil");
             }
             LUA_TSTRING | LUA_TNUMBER => {
                 lua_pushvalue(L, idx);
             }
             LUA_TBOOLEAN => {
                 if lua_toboolean(L, idx) == 0 {
-                    lua_pushliteral(L, "false");
+                    lua_pushliteral(L, c"false");
                 } else {
-                    lua_pushliteral(L, "true");
+                    lua_pushliteral(L, c"true");
                 }
             }
             t => {

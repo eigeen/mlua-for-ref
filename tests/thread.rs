@@ -1,6 +1,6 @@
 use std::panic::catch_unwind;
 
-use mlua::{Error, Function, Lua, Result, Thread, ThreadStatus};
+use mlua::{Error, Function, IntoLua, Lua, Result, Thread, ThreadStatus, Value};
 
 #[test]
 fn test_thread() -> Result<()> {
@@ -164,7 +164,7 @@ fn test_thread_reset() -> Result<()> {
     let result = thread.resume::<()>(());
     assert!(
         matches!(result, Err(Error::CallbackError{ ref cause, ..})
-            if matches!(cause.as_ref(), Error::RuntimeError(ref err)
+            if matches!(cause.as_ref(), Error::RuntimeError(err)
                 if err == "cannot reset a running thread")
         ),
         "unexpected result: {result:?}",
@@ -224,6 +224,52 @@ fn test_thread_pointer() -> Result<()> {
 
     assert_eq!(thread.to_pointer(), thread.clone().to_pointer());
     assert_ne!(thread.to_pointer(), lua.current_thread().to_pointer());
+
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "luau")]
+fn test_thread_resume_error() -> Result<()> {
+    let lua = Lua::new();
+
+    let thread = lua
+        .load(
+            r#"
+        coroutine.create(function()
+            local ok, err = pcall(coroutine.yield, 123)
+            assert(not ok, "yield should fail")
+            assert(err == "myerror", "unexpected error: " .. tostring(err))
+            return "success"
+        end)
+    "#,
+        )
+        .eval::<Thread>()?;
+
+    assert_eq!(thread.resume::<i64>(())?, 123);
+    let status = thread.resume_error::<String>("myerror").unwrap();
+    assert_eq!(status, "success");
+
+    Ok(())
+}
+
+#[test]
+fn test_thread_resume_bad_arg() -> Result<()> {
+    let lua = Lua::new();
+
+    struct BadArg;
+
+    impl IntoLua for BadArg {
+        fn into_lua(self, _lua: &Lua) -> Result<Value> {
+            Err(Error::runtime("bad arg"))
+        }
+    }
+
+    let f = lua.create_thread(lua.create_function(|_, ()| Ok("okay"))?)?;
+    let res = f.resume::<()>((123, BadArg));
+    assert!(matches!(res, Err(Error::RuntimeError(msg)) if msg == "bad arg"));
+    let res = f.resume::<String>(()).unwrap();
+    assert_eq!(res, "okay");
 
     Ok(())
 }

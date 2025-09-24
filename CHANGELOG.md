@@ -1,12 +1,73 @@
-## v0.10.5 (May 24th, 2025)
+## v0.11.3 (Aug 30, 2025)
 
-- mlua-sys is back to 0.6.x (Luau 0.663)
-- Reverted: Trigger abort when Luau userdata destructors are panic (requires new mlua-sys)
-- Reverted: Added large (52bit) integers support for Luau (breaking change)
+- Add `Lua::yield_with` to use as `coroutine.yield` functional replacement in async functions for any Lua
+- Do not try to yield at non-yielable points in Luau interrupt (#632)
+- Add `Buffer::cursor` method (Luau)
+- Add `Lua::create_buffer_with_capacity` method (Luau)
+- Make Lua reference values cheap to clone (only increments ref count)
+- Fix panic on large (>67M entries) table creation
+
+## v0.11.2 (Aug 10, 2025)
+
+- Faster stack push for `Variadic<T>`
+- Fix handling Windows paths with drive letter in Luau require (#623)
+- Make Luau registered aliases ascii case-insensitive (#620)
+- Fix deserializing negative zeros `-0.0` (#618)
+
+## v0.11.1 (Jul 15, 2025)
+
+- Fixed bug exhausting Lua auxiliary stack and leaving it without reserve (#615)
+- `Lua::push_c_function` now correctly handles OOM for Lua 5.1 and Luau
+
+## v0.11.0 (Jul 14, 2025)
+
+Changes since v0.11.0-beta.3
+
+- Allow linking external Lua libraries in a build script (e.g. pluto) using `external` mlua-sys feature flag
+- `Lua::inspect_stack` takes a callback with `&Debug` argument, instead of returning `Debug` directly
+- Added `Debug::function` method to get function running at a given level
+- `Debug::curr_line` is deprecated in favour of `Debug::current_line` that returns `Option<usize>`
+- Added `Lua::set_globals` method to replace global environment
+- `Table::set_metatable` now returns `Result<()>` (this operation can fail in sandboxed Luau mode)
+- `impl ToString` replaced with `Into<StdString>`  in `UserData` registration
+- `Value::as_str` and `Value::as_string_lossy` methods are deprecated (as they are non-idiomatic)
+- Bugfixes and improvements
+
+## v0.11.0-beta.3 (Jun 23, 2025)
+
+- Luau in sandboxed mode has reduced options in `collectgarbage` function (to follow the official doc)
+- `Function::deep_clone` now returns `Result<Function>` as this operation can trigger memory errors
+- Luau "Require" resolves included Lua files relative to the current directory (#605)
+- Fixed bug when finalizing `AsyncThread` on drop (`call_async` methods family)
+
+## v0.11.0-beta.2 (Jun 12, 2025)
+
+- Lua 5.4 updated to 5.4.8
+- Terminate Rust `Future` when `AsyncThread` is dropped (without relying on Lua GC)
+- Added `loadstring` function to Luau
+- Make `AsChunk` trait dyn-friendly
+- Luau `Require` trait synced with Luau 0.674
+- Luau `Require` trait methods now can return `Error` variant (in `NavigateError` enum)
+- Added `__type` to `Error`'s userdata metatable (for `typeof` function)
+- `parking_log/send_guard` is moved to `userdata-wrappers` feature flag
+- New `serde` feature flag to replace `serialize` (the old one is still available)
+
+## v0.11.0-beta.1 (May 7th, 2025)
+
+- New "require-by-string" for Luau (with `Require` trait and async support)
+- Added `Thread::resume_error` support for Luau
+- 52 bit integers support for Luau (this is a breaking change)
+- New features for Luau compiler (constants, disabled builtins, known members)
+- `AsyncThread<A, R>` changed to `AsyncThread<R>` (`A` pushed to stack immediately)
+- Lifetime `'a` moved from `AsChunk<'a>` to `AsChunk::source where Self: 'a`
+- `Lua::scope` pass `&Scope` instead of `&mut Scope` to closure
+- Added global hooks support (Lua 5.1+)
+- Added per-thread hooks support (Lua 5.1+)
+- `Lua::init_from_ptr` renamed to `Lua::get_or_init_from_ptr` and returns `&Lua`
+- `Lua:load_from_function` is deprecated (this is `register_module` now)
+- Added `Lua::register_module` and `Lua::preload_module`
 
 ## v0.10.4 (May 5th, 2025)
-
-_yanked_ because of semver-breaking changes
 
 - Luau updated to 0.672
 - New serde option `encode_empty_tables_as_array` to serialize empty tables as arrays
