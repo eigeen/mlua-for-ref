@@ -366,7 +366,7 @@ impl Thread {
     ///
     /// Sets a Lua function for the thread afterwards.
     ///
-    /// [Lua 5.4]: https://www.lua.org/manual/5.4/manual.html#lua_closethread
+    /// [Lua 5.4]: https://www.lua.org/manual/5.4/manual.html#lua_resetthread
     pub fn reset(&self, func: Function) -> Result<()> {
         let lua = self.0.lua.lock();
         let thread_state = self.state();
@@ -405,9 +405,9 @@ impl Thread {
             ThreadStatusInner::Yielded(_) | ThreadStatusInner::Error => {
                 let thread_state = self.state();
 
-                #[cfg(all(feature = "lua54", not(feature = "vendored")))]
+                #[cfg(feature = "lua54")]
                 let status = ffi::lua_resetthread(thread_state);
-                #[cfg(any(feature = "lua55", all(feature = "lua54", feature = "vendored")))]
+                #[cfg(feature = "lua55")]
                 let status = {
                     let lua = self.0.lua.lock();
                     ffi::lua_closethread(thread_state, lua.state())

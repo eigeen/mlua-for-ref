@@ -140,7 +140,7 @@ fn test_thread_reset() -> Result<()> {
     let _ = thread.resume::<AnyUserData>(MyUserData(arc.clone()));
     assert!(thread.is_error());
     assert_eq!(Arc::strong_count(&arc), 2);
-    #[cfg(any(feature = "lua55", feature = "lua54"))]
+    #[cfg(feature = "lua55")]
     {
         assert!(thread.reset(func.clone()).is_err());
         // Reset behavior has changed in Lua v5.4.4
@@ -149,7 +149,12 @@ fn test_thread_reset() -> Result<()> {
         assert!(thread.reset(func.clone()).is_ok());
         assert!(thread.is_resumable());
     }
-    #[cfg(any(feature = "lua55", feature = "lua54", feature = "luau"))]
+    #[cfg(all(feature = "lua54", feature = "vendored"))]
+    {
+        assert!(thread.reset(func.clone()).is_err());
+        assert!(thread.is_error());
+    }
+    #[cfg(any(feature = "lua55", all(feature = "lua54", not(feature = "vendored")), feature = "luau"))]
     {
         assert!(thread.reset(func.clone()).is_ok());
         assert!(thread.is_resumable());
