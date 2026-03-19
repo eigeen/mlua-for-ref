@@ -1,12 +1,10 @@
-use std::string::String as StdString;
-
+use crate::Function;
 use crate::error::{Error, Result};
 use crate::state::WeakLua;
 use crate::table::Table;
 use crate::traits::{FromLua, FromLuaMulti, IntoLua, IntoLuaMulti, ObjectLike};
 use crate::userdata::AnyUserData;
 use crate::value::Value;
-use crate::Function;
 
 #[cfg(feature = "async")]
 use crate::function::AsyncCallFuture;
@@ -88,7 +86,7 @@ impl ObjectLike for AnyUserData {
     }
 
     #[inline]
-    fn to_string(&self) -> Result<StdString> {
+    fn to_string(&self) -> Result<String> {
         Value::UserData(self.clone()).to_string()
     }
 

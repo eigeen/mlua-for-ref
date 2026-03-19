@@ -1,19 +1,18 @@
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::os::raw::c_void;
-use std::string::String as StdString;
 use std::{fmt, ptr, str};
 
 use num_traits::FromPrimitive;
 
 use crate::error::{Error, Result};
 use crate::function::Function;
-use crate::string::{BorrowedStr, String};
+use crate::string::{BorrowedStr, LuaString};
 use crate::table::Table;
 use crate::thread::Thread;
 use crate::types::{Integer, LightUserData, Number, ValueRef};
 use crate::userdata::AnyUserData;
-use crate::util::{check_stack, StackGuard};
+use crate::util::{StackGuard, check_stack};
 
 #[cfg(feature = "serde")]
 use {
@@ -28,9 +27,10 @@ use {
 /// The non-primitive variants (eg. string/table/function/thread/userdata) contain handle types
 /// into the internal Lua state. It is a logic error to mix handle types between separate
 /// `Lua` instances, and doing so will result in a panic.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub enum Value {
     /// The Lua value `nil`.
+    #[default]
     Nil,
     /// The Lua value `true` or `false`.
     Boolean(bool),
@@ -49,7 +49,7 @@ pub enum Value {
     /// An interned string, managed by Lua.
     ///
     /// Unlike Rust strings, Lua strings may not be valid UTF-8.
-    String(String),
+    String(LuaString),
     /// Reference to a Lua table.
     Table(Table),
     /// Reference to a Lua function (or closure).
@@ -128,7 +128,7 @@ impl Value {
     #[inline]
     pub fn to_pointer(&self) -> *const c_void {
         match self {
-            Value::String(String(vref)) => {
+            Value::String(LuaString(vref)) => {
                 // In Lua < 5.4 (excluding Luau), string pointers are NULL
                 // Use alternative approach
                 let lua = vref.lua.lock();
@@ -150,8 +150,8 @@ impl Value {
     ///
     /// This might invoke the `__tostring` metamethod for non-primitive types (eg. tables,
     /// functions).
-    pub fn to_string(&self) -> Result<StdString> {
-        unsafe fn invoke_to_string(vref: &ValueRef) -> Result<StdString> {
+    pub fn to_string(&self) -> Result<String> {
+        unsafe fn invoke_tostring(vref: &ValueRef) -> Result<String> {
             let lua = vref.lua.lock();
             let state = lua.state();
             let _guard = StackGuard::new(state);
@@ -161,7 +161,7 @@ impl Value {
             protect_lua!(state, 1, 1, fn(state) {
                 ffi::luaL_tolstring(state, -1, ptr::null_mut());
             })?;
-            Ok(String(lua.pop_ref()).to_str()?.to_string())
+            Ok(LuaString(lua.pop_ref()).to_str()?.to_string())
         }
 
         match self {
@@ -178,9 +178,9 @@ impl Value {
             | Value::Function(Function(vref))
             | Value::Thread(Thread(vref, ..))
             | Value::UserData(AnyUserData(vref))
-            | Value::Other(vref) => unsafe { invoke_to_string(vref) },
+            | Value::Other(vref) => unsafe { invoke_tostring(vref) },
             #[cfg(feature = "luau")]
-            Value::Buffer(crate::Buffer(vref)) => unsafe { invoke_to_string(vref) },
+            Value::Buffer(crate::Buffer(vref)) => unsafe { invoke_tostring(vref) },
             Value::Error(err) => Ok(err.to_string()),
         }
     }
@@ -335,17 +335,17 @@ impl Value {
         self.as_number()
     }
 
-    /// Returns `true` if the value is a Lua [`String`].
+    /// Returns `true` if the value is a [`LuaString`].
     #[inline]
     pub fn is_string(&self) -> bool {
         self.as_string().is_some()
     }
 
-    /// Cast the value to Lua [`String`].
+    /// Cast the value to a [`LuaString`].
     ///
-    /// If the value is a Lua [`String`], returns it or `None` otherwise.
+    /// If the value is a [`LuaString`], returns it or `None` otherwise.
     #[inline]
-    pub fn as_string(&self) -> Option<&String> {
+    pub fn as_string(&self) -> Option<&LuaString> {
         match self {
             Value::String(s) => Some(s),
             _ => None,
@@ -354,26 +354,26 @@ impl Value {
 
     /// Cast the value to [`BorrowedStr`].
     ///
-    /// If the value is a Lua [`String`], try to convert it to [`BorrowedStr`] or return `None`
+    /// If the value is a [`LuaString`], try to convert it to [`BorrowedStr`] or return `None`
     /// otherwise.
     #[deprecated(
         since = "0.11.0",
         note = "This method does not follow Rust naming convention. Use `as_string().and_then(|s| s.to_str().ok())` instead."
     )]
     #[inline]
-    pub fn as_str(&self) -> Option<BorrowedStr<'_>> {
+    pub fn as_str(&self) -> Option<BorrowedStr> {
         self.as_string().and_then(|s| s.to_str().ok())
     }
 
-    /// Cast the value to [`StdString`].
+    /// Cast the value to [`String`].
     ///
-    /// If the value is a Lua [`String`], converts it to [`StdString`] or returns `None` otherwise.
+    /// If the value is a [`LuaString`], converts it to [`String`] or returns `None` otherwise.
     #[deprecated(
         since = "0.11.0",
         note = "This method does not follow Rust naming convention. Use `as_string().map(|s| s.to_string_lossy())` instead."
     )]
     #[inline]
-    pub fn as_string_lossy(&self) -> Option<StdString> {
+    pub fn as_string_lossy(&self) -> Option<String> {
         self.as_string().map(|s| s.to_string_lossy())
     }
 
@@ -561,27 +561,13 @@ impl Value {
             t @ Value::Table(_) => write!(fmt, "table: {:?}", t.to_pointer()),
             f @ Value::Function(_) => write!(fmt, "function: {:?}", f.to_pointer()),
             t @ Value::Thread(_) => write!(fmt, "thread: {:?}", t.to_pointer()),
-            u @ Value::UserData(ud) => {
-                // Try `__name/__type` first then `__tostring`
-                let name = ud.type_name().ok().flatten();
-                let s = name
-                    .map(|name| format!("{name}: {:?}", u.to_pointer()))
-                    .or_else(|| u.to_string().ok())
-                    .unwrap_or_else(|| format!("userdata: {:?}", u.to_pointer()));
-                write!(fmt, "{s}")
-            }
+            Value::UserData(ud) => ud.fmt_pretty(fmt),
             #[cfg(feature = "luau")]
             buf @ Value::Buffer(_) => write!(fmt, "buffer: {:?}", buf.to_pointer()),
             Value::Error(e) if recursive => write!(fmt, "{e:?}"),
             Value::Error(_) => write!(fmt, "error"),
             Value::Other(v) => write!(fmt, "other: {:?}", v.to_pointer()),
         }
-    }
-}
-
-impl Default for Value {
-    fn default() -> Self {
-        Self::Nil
     }
 }
 

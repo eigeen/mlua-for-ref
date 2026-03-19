@@ -1,4 +1,4 @@
-use std::any::{type_name, TypeId};
+use std::any::{TypeId, type_name};
 use std::ops::{Deref, DerefMut};
 use std::os::raw::c_int;
 use std::{fmt, mem};
@@ -12,7 +12,6 @@ use crate::value::Value;
 
 use super::cell::{UserDataStorage, UserDataVariant};
 use super::lock::{LockGuard, RawLock, UserDataLock};
-use super::util::is_sync;
 
 #[cfg(feature = "userdata-wrappers")]
 use {
@@ -63,11 +62,10 @@ impl<T> TryFrom<UserDataVariant<T>> for UserDataRef<T> {
 
     #[inline]
     fn try_from(variant: UserDataVariant<T>) -> Result<Self> {
-        let guard = if cfg!(not(feature = "send")) || is_sync::<T>() {
-            variant.raw_lock().try_lock_shared_guarded()
-        } else {
-            variant.raw_lock().try_lock_exclusive_guarded()
-        };
+        // Shared (read) lock is always correct:
+        // - with `send` feature, `T: Sync` is guaranteed by the `MaybeSync` bound on userdata creation
+        // - without `send` feature, single-threaded access makes shared lock safe for any `T`
+        let guard = variant.raw_lock().try_lock_shared_guarded();
         let guard = guard.map_err(|_| Error::UserDataBorrowError)?;
         let guard = unsafe { mem::transmute::<LockGuard<_>, LockGuard<'static, _>>(guard) };
         Ok(UserDataRef::from_parts(UserDataRefInner::Default(variant), guard))
@@ -446,11 +444,11 @@ impl<T> DerefMut for UserDataRefMutInner<T> {
 fn try_value_to_userdata<T>(value: Value) -> Result<AnyUserData> {
     match value {
         Value::UserData(ud) => Ok(ud),
-        _ => Err(Error::FromLuaConversionError {
-            from: value.type_name(),
-            to: "userdata".to_string(),
-            message: Some(format!("expected userdata of type {}", type_name::<T>())),
-        }),
+        _ => Err(Error::from_lua_conversion(
+            value.type_name(),
+            "userdata",
+            format!("expected userdata of type {}", type_name::<T>()),
+        )),
     }
 }
 

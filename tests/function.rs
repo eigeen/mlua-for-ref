@@ -1,4 +1,4 @@
-use mlua::{Error, Function, Lua, Result, String, Table, Variadic};
+use mlua::{Error, Function, Lua, LuaString, Result, Table, Variadic};
 
 #[test]
 fn test_function_call() -> Result<()> {
@@ -194,6 +194,25 @@ fn test_function_info() -> Result<()> {
     assert_eq!(print_info.what, "C");
     assert_eq!(print_info.line_defined, None);
 
+    // Function with upvalues and params
+    #[cfg(not(any(feature = "lua51", feature = "luajit")))]
+    {
+        let func_with_upvalues = lua
+            .load(
+                r#"
+        local x, y = ...
+        return function(a, ...)
+            return a*x + y
+        end
+    "#,
+            )
+            .call::<Function>((10, 20))?;
+        let func_with_upvalues_info = func_with_upvalues.info();
+        assert_eq!(func_with_upvalues_info.num_upvalues, 2);
+        assert_eq!(func_with_upvalues_info.num_params, 1);
+        assert_eq!(func_with_upvalues_info.is_vararg, true);
+    }
+
     Ok(())
 }
 
@@ -248,7 +267,7 @@ fn test_function_coverage() -> Result<()> {
 
     assert_eq!(
         report[0],
-        mlua::CoverageInfo {
+        mlua::function::CoverageInfo {
             function: None,
             line_defined: 1,
             depth: 0,
@@ -257,7 +276,7 @@ fn test_function_coverage() -> Result<()> {
     );
     assert_eq!(
         report[1],
-        mlua::CoverageInfo {
+        mlua::function::CoverageInfo {
             function: Some("abc".into()),
             line_defined: 4,
             depth: 1,
@@ -266,7 +285,7 @@ fn test_function_coverage() -> Result<()> {
     );
     assert_eq!(
         report[2],
-        mlua::CoverageInfo {
+        mlua::function::CoverageInfo {
             function: None,
             line_defined: 12,
             depth: 1,
@@ -275,7 +294,7 @@ fn test_function_coverage() -> Result<()> {
     );
     assert_eq!(
         report[3],
-        mlua::CoverageInfo {
+        mlua::function::CoverageInfo {
             function: None,
             line_defined: 13,
             depth: 2,
@@ -324,7 +343,7 @@ fn test_function_deep_clone() -> Result<()> {
 fn test_function_wrap() -> Result<()> {
     let lua = Lua::new();
 
-    let f = Function::wrap(|s: String, n| Ok(s.to_str().unwrap().repeat(n)));
+    let f = Function::wrap(|s: LuaString, n| Ok(s.to_str().unwrap().repeat(n)));
     lua.globals().set("f", f)?;
     lua.load(r#"assert(f("hello", 2) == "hellohello")"#)
         .exec()

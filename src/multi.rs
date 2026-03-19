@@ -1,4 +1,4 @@
-use std::collections::{vec_deque, VecDeque};
+use std::collections::{VecDeque, vec_deque};
 use std::iter::FromIterator;
 use std::mem;
 use std::ops::{Deref, DerefMut};
@@ -201,6 +201,23 @@ impl IntoLuaMulti for MultiValue {
     #[inline]
     fn into_lua_multi(self, _: &Lua) -> Result<MultiValue> {
         Ok(self)
+    }
+}
+
+impl IntoLuaMulti for &MultiValue {
+    #[inline]
+    fn into_lua_multi(self, _: &Lua) -> Result<MultiValue> {
+        Ok(self.clone())
+    }
+
+    #[inline]
+    unsafe fn push_into_stack_multi(self, lua: &RawLua) -> Result<c_int> {
+        let nresults = self.len() as i32;
+        check_stack(lua.state(), nresults + 1)?;
+        for value in &self.0 {
+            lua.push_value(value)?;
+        }
+        Ok(nresults)
     }
 }
 

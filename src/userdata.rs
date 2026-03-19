@@ -1,18 +1,33 @@
+//! Lua userdata handling.
+//!
+//! This module provides types for creating and working with Lua userdata from Rust.
+//!
+//! # Main Types
+//!
+//! - [`AnyUserData`] - A handle to a Lua userdata value of any Rust type.
+//! - [`UserData`] - Trait to implement for types that should be exposed to Lua as userdata.
+//! - [`UserDataFields`] - Trait for registering fields on userdata types.
+//! - [`UserDataMethods`] - Trait for registering methods on userdata types.
+//! - [`UserDataRegistry`] - Registry for userdata methods and fields.
+//! - [`UserDataMetatable`] - A handle to the metatable of a userdata type.
+//! - [`UserDataRef`] - A borrowed reference to a userdata value.
+//! - [`UserDataRefMut`] - A mutably borrowed reference to a userdata value.
+//! - [`MetaMethod`] - Metamethod names for customizing Lua operators.
+
 use std::any::TypeId;
 use std::ffi::CStr;
 use std::fmt;
 use std::hash::Hash;
 use std::os::raw::{c_char, c_void};
-use std::string::String as StdString;
 
 use crate::error::{Error, Result};
 use crate::function::Function;
 use crate::state::Lua;
-use crate::string::String;
+use crate::string::LuaString;
 use crate::table::{Table, TablePairs};
 use crate::traits::{FromLua, FromLuaMulti, IntoLua, IntoLuaMulti};
-use crate::types::{MaybeSend, ValueRef};
-use crate::util::{check_stack, get_userdata, push_string, take_userdata, StackGuard};
+use crate::types::{MaybeSend, MaybeSync, ValueRef};
+use crate::util::{StackGuard, check_stack, get_userdata, push_string, short_type_name, take_userdata};
 use crate::value::Value;
 
 #[cfg(feature = "async")]
@@ -30,8 +45,8 @@ pub use r#ref::{UserDataRef, UserDataRefMut};
 pub use registry::UserDataRegistry;
 pub(crate) use registry::{RawUserDataRegistry, UserDataProxy};
 pub(crate) use util::{
-    borrow_userdata_scoped, borrow_userdata_scoped_mut, collect_userdata, init_userdata_metatable,
-    TypeIdHints,
+    TypeIdHints, borrow_userdata_scoped, borrow_userdata_scoped_mut, collect_userdata,
+    init_userdata_metatable,
 };
 
 /// Kinds of metamethods that can be overridden.
@@ -56,32 +71,53 @@ pub enum MetaMethod {
     /// The unary minus (`-`) operator.
     Unm,
     /// The floor division (//) operator.
-    #[cfg(any(feature = "lua54", feature = "lua53", feature = "luau"))]
-    #[cfg_attr(docsrs, doc(cfg(any(feature = "lua54", feature = "lua53", feature = "luau"))))]
+    #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53", feature = "luau"))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(any(feature = "lua55", feature = "lua54", feature = "lua53", feature = "luau")))
+    )]
     IDiv,
     /// The bitwise AND (&) operator.
-    #[cfg(any(feature = "lua54", feature = "lua53"))]
-    #[cfg_attr(docsrs, doc(cfg(any(feature = "lua54", feature = "lua53"))))]
+    #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53"))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(any(feature = "lua55", feature = "lua54", feature = "lua53")))
+    )]
     BAnd,
     /// The bitwise OR (|) operator.
-    #[cfg(any(feature = "lua54", feature = "lua53"))]
-    #[cfg_attr(docsrs, doc(cfg(any(feature = "lua54", feature = "lua53"))))]
+    #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53"))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(any(feature = "lua55", feature = "lua54", feature = "lua53")))
+    )]
     BOr,
     /// The bitwise XOR (binary ~) operator.
-    #[cfg(any(feature = "lua54", feature = "lua53"))]
-    #[cfg_attr(docsrs, doc(cfg(any(feature = "lua54", feature = "lua53"))))]
+    #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53"))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(any(feature = "lua55", feature = "lua54", feature = "lua53")))
+    )]
     BXor,
     /// The bitwise NOT (unary ~) operator.
-    #[cfg(any(feature = "lua54", feature = "lua53"))]
-    #[cfg_attr(docsrs, doc(cfg(any(feature = "lua54", feature = "lua53"))))]
+    #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53"))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(any(feature = "lua55", feature = "lua54", feature = "lua53")))
+    )]
     BNot,
     /// The bitwise left shift (<<) operator.
-    #[cfg(any(feature = "lua54", feature = "lua53"))]
-    #[cfg_attr(docsrs, doc(cfg(any(feature = "lua54", feature = "lua53"))))]
+    #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53"))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(any(feature = "lua55", feature = "lua54", feature = "lua53")))
+    )]
     Shl,
     /// The bitwise right shift (>>) operator.
-    #[cfg(any(feature = "lua54", feature = "lua53"))]
-    #[cfg_attr(docsrs, doc(cfg(any(feature = "lua54", feature = "lua53"))))]
+    #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53"))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(any(feature = "lua55", feature = "lua54", feature = "lua53")))
+    )]
     Shr,
     /// The string concatenation operator `..`.
     Concat,
@@ -103,13 +139,30 @@ pub enum MetaMethod {
     ///
     /// This is not an operator, but will be called by methods such as `tostring` and `print`.
     ToString,
+    /// The `__todebugstring` metamethod for debug purposes.
+    ///
+    /// This is an mlua-specific metamethod that can be used to provide debug representation for
+    /// userdata.
+    ToDebugString,
     /// The `__pairs` metamethod.
     ///
     /// This is not an operator, but it will be called by the built-in `pairs` function.
-    #[cfg(any(feature = "lua54", feature = "lua53", feature = "lua52", feature = "luajit52"))]
+    #[cfg(any(
+        feature = "lua55",
+        feature = "lua54",
+        feature = "lua53",
+        feature = "lua52",
+        feature = "luajit52"
+    ))]
     #[cfg_attr(
         docsrs,
-        doc(cfg(any(feature = "lua54", feature = "lua53", feature = "lua52", feature = "luajit52")))
+        doc(cfg(any(
+            feature = "lua55",
+            feature = "lua54",
+            feature = "lua53",
+            feature = "lua52",
+            feature = "luajit52"
+        )))
     )]
     Pairs,
     /// The `__ipairs` metamethod.
@@ -135,8 +188,8 @@ pub enum MetaMethod {
     /// [documentation][lua_doc].
     ///
     /// [lua_doc]: https://www.lua.org/manual/5.4/manual.html#3.3.8
-    #[cfg(feature = "lua54")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "lua54")))]
+    #[cfg(any(feature = "lua55", feature = "lua54"))]
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "lua55", feature = "lua54"))))]
     Close,
     /// The `__name`/`__type` metafield.
     ///
@@ -152,7 +205,7 @@ impl PartialEq<MetaMethod> for &str {
     }
 }
 
-impl PartialEq<MetaMethod> for StdString {
+impl PartialEq<MetaMethod> for String {
     fn eq(&self, other: &MetaMethod) -> bool {
         self == other.name()
     }
@@ -176,19 +229,19 @@ impl MetaMethod {
             MetaMethod::Pow => "__pow",
             MetaMethod::Unm => "__unm",
 
-            #[cfg(any(feature = "lua54", feature = "lua53", feature = "luau"))]
+            #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53", feature = "luau"))]
             MetaMethod::IDiv => "__idiv",
-            #[cfg(any(feature = "lua54", feature = "lua53"))]
+            #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53"))]
             MetaMethod::BAnd => "__band",
-            #[cfg(any(feature = "lua54", feature = "lua53"))]
+            #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53"))]
             MetaMethod::BOr => "__bor",
-            #[cfg(any(feature = "lua54", feature = "lua53"))]
+            #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53"))]
             MetaMethod::BXor => "__bxor",
-            #[cfg(any(feature = "lua54", feature = "lua53"))]
+            #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53"))]
             MetaMethod::BNot => "__bnot",
-            #[cfg(any(feature = "lua54", feature = "lua53"))]
+            #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53"))]
             MetaMethod::Shl => "__shl",
-            #[cfg(any(feature = "lua54", feature = "lua53"))]
+            #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53"))]
             MetaMethod::Shr => "__shr",
 
             MetaMethod::Concat => "__concat",
@@ -200,15 +253,22 @@ impl MetaMethod {
             MetaMethod::NewIndex => "__newindex",
             MetaMethod::Call => "__call",
             MetaMethod::ToString => "__tostring",
+            MetaMethod::ToDebugString => "__todebugstring",
 
-            #[cfg(any(feature = "lua54", feature = "lua53", feature = "lua52", feature = "luajit52"))]
+            #[cfg(any(
+                feature = "lua55",
+                feature = "lua54",
+                feature = "lua53",
+                feature = "lua52",
+                feature = "luajit52"
+            ))]
             MetaMethod::Pairs => "__pairs",
             #[cfg(any(feature = "lua52", feature = "luajit52"))]
             MetaMethod::IPairs => "__ipairs",
             #[cfg(feature = "luau")]
             MetaMethod::Iter => "__iter",
 
-            #[cfg(feature = "lua54")]
+            #[cfg(any(feature = "lua55", feature = "lua54"))]
             MetaMethod::Close => "__close",
 
             #[rustfmt::skip]
@@ -240,7 +300,7 @@ impl AsRef<str> for MetaMethod {
     }
 }
 
-impl From<MetaMethod> for StdString {
+impl From<MetaMethod> for String {
     #[inline]
     fn from(method: MetaMethod) -> Self {
         method.name().to_owned()
@@ -256,7 +316,7 @@ pub trait UserDataMethods<T> {
     ///
     /// If `add_meta_method` is used to set the `__index` metamethod, the `__index` metamethod will
     /// be used as a fall-back if no regular method is found.
-    fn add_method<M, A, R>(&mut self, name: impl Into<StdString>, method: M)
+    fn add_method<M, A, R>(&mut self, name: impl Into<String>, method: M)
     where
         M: Fn(&Lua, &T, A) -> Result<R> + MaybeSend + 'static,
         A: FromLuaMulti,
@@ -267,11 +327,34 @@ pub trait UserDataMethods<T> {
     /// Refer to [`add_method`] for more information about the implementation.
     ///
     /// [`add_method`]: UserDataMethods::add_method
-    fn add_method_mut<M, A, R>(&mut self, name: impl Into<StdString>, method: M)
+    fn add_method_mut<M, A, R>(&mut self, name: impl Into<String>, method: M)
     where
         M: FnMut(&Lua, &mut T, A) -> Result<R> + MaybeSend + 'static,
         A: FromLuaMulti,
         R: IntoLuaMulti;
+
+    /// Add a method which accepts `T` as the first parameter.
+    ///
+    /// The userdata `T` will be moved out of the userdata container. This is useful for
+    /// methods that need to consume the userdata.
+    ///
+    /// The method can be called only once per userdata instance, subsequent calls will result in a
+    /// [`Error::UserDataDestructed`] error.
+    #[doc(hidden)]
+    fn add_method_once<M, A, R>(&mut self, name: impl Into<String>, method: M)
+    where
+        T: 'static,
+        M: Fn(&Lua, T, A) -> Result<R> + MaybeSend + 'static,
+        A: FromLuaMulti,
+        R: IntoLuaMulti,
+    {
+        let name = name.into();
+        let method_name = format!("{}.{name}", short_type_name::<T>());
+        self.add_function(name, move |lua, (ud, args): (AnyUserData, A)| {
+            let this = (ud.take()).map_err(|err| Error::bad_self_argument(&method_name, err))?;
+            method(lua, this, args)
+        });
+    }
 
     /// Add an async method which accepts a `&T` as the first parameter and returns [`Future`].
     ///
@@ -280,7 +363,7 @@ pub trait UserDataMethods<T> {
     /// [`add_method`]: UserDataMethods::add_method
     #[cfg(feature = "async")]
     #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
-    fn add_async_method<M, A, MR, R>(&mut self, name: impl Into<StdString>, method: M)
+    fn add_async_method<M, A, MR, R>(&mut self, name: impl Into<String>, method: M)
     where
         T: 'static,
         M: Fn(Lua, UserDataRef<T>, A) -> MR + MaybeSend + 'static,
@@ -295,7 +378,7 @@ pub trait UserDataMethods<T> {
     /// [`add_method`]: UserDataMethods::add_method
     #[cfg(feature = "async")]
     #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
-    fn add_async_method_mut<M, A, MR, R>(&mut self, name: impl Into<StdString>, method: M)
+    fn add_async_method_mut<M, A, MR, R>(&mut self, name: impl Into<String>, method: M)
     where
         T: 'static,
         M: Fn(Lua, UserDataRefMut<T>, A) -> MR + MaybeSend + 'static,
@@ -303,12 +386,40 @@ pub trait UserDataMethods<T> {
         MR: Future<Output = Result<R>> + MaybeSend + 'static,
         R: IntoLuaMulti;
 
+    /// Add an async method which accepts a `T` as the first parameter and returns [`Future`].
+    ///
+    /// The userdata `T` will be moved out of the userdata container. This is useful for
+    /// methods that need to consume the userdata.
+    ///
+    /// The method can be called only once per userdata instance, subsequent calls will result in a
+    /// [`Error::UserDataDestructed`] error.
+    #[cfg(feature = "async")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+    #[doc(hidden)]
+    fn add_async_method_once<M, A, MR, R>(&mut self, name: impl Into<String>, method: M)
+    where
+        T: 'static,
+        M: Fn(Lua, T, A) -> MR + MaybeSend + 'static,
+        A: FromLuaMulti,
+        MR: Future<Output = Result<R>> + MaybeSend + 'static,
+        R: IntoLuaMulti,
+    {
+        let name = name.into();
+        let method_name = format!("{}.{name}", short_type_name::<T>());
+        self.add_async_function(name, move |lua, (ud, args): (AnyUserData, A)| {
+            match (ud.take()).map_err(|err| Error::bad_self_argument(&method_name, err)) {
+                Ok(this) => either::Either::Left(method(lua, this, args)),
+                Err(err) => either::Either::Right(async move { Err(err) }),
+            }
+        });
+    }
+
     /// Add a regular method as a function which accepts generic arguments.
     ///
     /// The first argument will be a [`AnyUserData`] of type `T` if the method is called with Lua
     /// method syntax: `my_userdata:my_method(arg1, arg2)`, or it is passed in as the first
     /// argument: `my_userdata.my_method(my_userdata, arg1, arg2)`.
-    fn add_function<F, A, R>(&mut self, name: impl Into<StdString>, function: F)
+    fn add_function<F, A, R>(&mut self, name: impl Into<String>, function: F)
     where
         F: Fn(&Lua, A) -> Result<R> + MaybeSend + 'static,
         A: FromLuaMulti,
@@ -319,7 +430,7 @@ pub trait UserDataMethods<T> {
     /// This is a version of [`add_function`] that accepts a `FnMut` argument.
     ///
     /// [`add_function`]: UserDataMethods::add_function
-    fn add_function_mut<F, A, R>(&mut self, name: impl Into<StdString>, function: F)
+    fn add_function_mut<F, A, R>(&mut self, name: impl Into<String>, function: F)
     where
         F: FnMut(&Lua, A) -> Result<R> + MaybeSend + 'static,
         A: FromLuaMulti,
@@ -333,7 +444,7 @@ pub trait UserDataMethods<T> {
     /// [`add_function`]: UserDataMethods::add_function
     #[cfg(feature = "async")]
     #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
-    fn add_async_function<F, A, FR, R>(&mut self, name: impl Into<StdString>, function: F)
+    fn add_async_function<F, A, FR, R>(&mut self, name: impl Into<String>, function: F)
     where
         F: Fn(Lua, A) -> FR + MaybeSend + 'static,
         A: FromLuaMulti,
@@ -348,7 +459,7 @@ pub trait UserDataMethods<T> {
     /// side has a metatable. To prevent this, use [`add_meta_function`].
     ///
     /// [`add_meta_function`]: UserDataMethods::add_meta_function
-    fn add_meta_method<M, A, R>(&mut self, name: impl Into<StdString>, method: M)
+    fn add_meta_method<M, A, R>(&mut self, name: impl Into<String>, method: M)
     where
         M: Fn(&Lua, &T, A) -> Result<R> + MaybeSend + 'static,
         A: FromLuaMulti,
@@ -362,7 +473,7 @@ pub trait UserDataMethods<T> {
     /// side has a metatable. To prevent this, use [`add_meta_function`].
     ///
     /// [`add_meta_function`]: UserDataMethods::add_meta_function
-    fn add_meta_method_mut<M, A, R>(&mut self, name: impl Into<StdString>, method: M)
+    fn add_meta_method_mut<M, A, R>(&mut self, name: impl Into<String>, method: M)
     where
         M: FnMut(&Lua, &mut T, A) -> Result<R> + MaybeSend + 'static,
         A: FromLuaMulti,
@@ -378,7 +489,7 @@ pub trait UserDataMethods<T> {
         docsrs,
         doc(cfg(all(feature = "async", not(any(feature = "lua51", feature = "luau")))))
     )]
-    fn add_async_meta_method<M, A, MR, R>(&mut self, name: impl Into<StdString>, method: M)
+    fn add_async_meta_method<M, A, MR, R>(&mut self, name: impl Into<String>, method: M)
     where
         T: 'static,
         M: Fn(Lua, UserDataRef<T>, A) -> MR + MaybeSend + 'static,
@@ -394,7 +505,7 @@ pub trait UserDataMethods<T> {
     /// [`add_meta_method_mut`]: UserDataMethods::add_meta_method_mut
     #[cfg(all(feature = "async", not(any(feature = "lua51", feature = "luau"))))]
     #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
-    fn add_async_meta_method_mut<M, A, MR, R>(&mut self, name: impl Into<StdString>, method: M)
+    fn add_async_meta_method_mut<M, A, MR, R>(&mut self, name: impl Into<String>, method: M)
     where
         T: 'static,
         M: Fn(Lua, UserDataRefMut<T>, A) -> MR + MaybeSend + 'static,
@@ -407,7 +518,7 @@ pub trait UserDataMethods<T> {
     /// Metamethods for binary operators can be triggered if either the left or right argument to
     /// the binary operator has a metatable, so the first argument here is not necessarily a
     /// userdata of type `T`.
-    fn add_meta_function<F, A, R>(&mut self, name: impl Into<StdString>, function: F)
+    fn add_meta_function<F, A, R>(&mut self, name: impl Into<String>, function: F)
     where
         F: Fn(&Lua, A) -> Result<R> + MaybeSend + 'static,
         A: FromLuaMulti,
@@ -418,7 +529,7 @@ pub trait UserDataMethods<T> {
     /// This is a version of [`add_meta_function`] that accepts a `FnMut` argument.
     ///
     /// [`add_meta_function`]: UserDataMethods::add_meta_function
-    fn add_meta_function_mut<F, A, R>(&mut self, name: impl Into<StdString>, function: F)
+    fn add_meta_function_mut<F, A, R>(&mut self, name: impl Into<String>, function: F)
     where
         F: FnMut(&Lua, A) -> Result<R> + MaybeSend + 'static,
         A: FromLuaMulti,
@@ -434,7 +545,7 @@ pub trait UserDataMethods<T> {
         docsrs,
         doc(cfg(all(feature = "async", not(any(feature = "lua51", feature = "luau")))))
     )]
-    fn add_async_meta_function<F, A, FR, R>(&mut self, name: impl Into<StdString>, function: F)
+    fn add_async_meta_function<F, A, FR, R>(&mut self, name: impl Into<String>, function: F)
     where
         F: Fn(Lua, A) -> FR + MaybeSend + 'static,
         A: FromLuaMulti,
@@ -453,7 +564,7 @@ pub trait UserDataFields<T> {
     ///
     /// If `add_meta_method` is used to set the `__index` metamethod, it will
     /// be used as a fall-back if no regular field or method are found.
-    fn add_field<V>(&mut self, name: impl Into<StdString>, value: V)
+    fn add_field<V>(&mut self, name: impl Into<String>, value: V)
     where
         V: IntoLua + 'static;
 
@@ -464,7 +575,7 @@ pub trait UserDataFields<T> {
     ///
     /// If `add_meta_method` is used to set the `__index` metamethod, the `__index` metamethod will
     /// be used as a fall-back if no regular field or method are found.
-    fn add_field_method_get<M, R>(&mut self, name: impl Into<StdString>, method: M)
+    fn add_field_method_get<M, R>(&mut self, name: impl Into<String>, method: M)
     where
         M: Fn(&Lua, &T) -> Result<R> + MaybeSend + 'static,
         R: IntoLua;
@@ -477,21 +588,21 @@ pub trait UserDataFields<T> {
     ///
     /// If `add_meta_method` is used to set the `__newindex` metamethod, the `__newindex` metamethod
     /// will be used as a fall-back if no regular field is found.
-    fn add_field_method_set<M, A>(&mut self, name: impl Into<StdString>, method: M)
+    fn add_field_method_set<M, A>(&mut self, name: impl Into<String>, method: M)
     where
         M: FnMut(&Lua, &mut T, A) -> Result<()> + MaybeSend + 'static,
         A: FromLua;
 
     /// Add a regular field getter as a function which accepts a generic [`AnyUserData`] of type `T`
     /// argument.
-    fn add_field_function_get<F, R>(&mut self, name: impl Into<StdString>, function: F)
+    fn add_field_function_get<F, R>(&mut self, name: impl Into<String>, function: F)
     where
         F: Fn(&Lua, AnyUserData) -> Result<R> + MaybeSend + 'static,
         R: IntoLua;
 
     /// Add a regular field setter as a function which accepts a generic [`AnyUserData`] of type `T`
     /// first argument.
-    fn add_field_function_set<F, A>(&mut self, name: impl Into<StdString>, function: F)
+    fn add_field_function_set<F, A>(&mut self, name: impl Into<String>, function: F)
     where
         F: FnMut(&Lua, AnyUserData, A) -> Result<()> + MaybeSend + 'static,
         A: FromLua;
@@ -504,7 +615,7 @@ pub trait UserDataFields<T> {
     ///
     /// `mlua` will trigger an error on an attempt to define a protected metamethod,
     /// like `__gc` or `__metatable`.
-    fn add_meta_field<V>(&mut self, name: impl Into<StdString>, value: V)
+    fn add_meta_field<V>(&mut self, name: impl Into<String>, value: V)
     where
         V: IntoLua + 'static;
 
@@ -516,7 +627,7 @@ pub trait UserDataFields<T> {
     ///
     /// `mlua` will trigger an error on an attempt to define a protected metamethod,
     /// like `__gc` or `__metatable`.
-    fn add_meta_field_with<F, R>(&mut self, name: impl Into<StdString>, f: F)
+    fn add_meta_field_with<F, R>(&mut self, name: impl Into<String>, f: F)
     where
         F: FnOnce(&Lua) -> Result<R> + 'static,
         R: IntoLua;
@@ -616,7 +727,7 @@ pub trait UserData: Sized {
 ///
 /// [`is`]: crate::AnyUserData::is
 /// [`borrow`]: crate::AnyUserData::borrow
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct AnyUserData(pub(crate) ValueRef);
 
 impl AnyUserData {
@@ -626,6 +737,14 @@ impl AnyUserData {
         let type_id = self.type_id();
         // We do not use wrapped types here, rather prefer to check the "real" type of the userdata
         matches!(type_id, Some(type_id) if type_id == TypeId::of::<T>())
+    }
+
+    /// Checks whether the type of this userdata is a [proxy object] for `T`.
+    ///
+    /// [proxy object]: crate::Lua::create_proxy
+    #[inline]
+    pub fn is_proxy<T: 'static>(&self) -> bool {
+        self.is::<UserDataProxy<T>>()
     }
 
     /// Borrow this userdata immutably if it is of type `T`.
@@ -921,8 +1040,10 @@ impl AnyUserData {
         lua.get_userdata_ref_type_id(&self.0).ok().flatten()
     }
 
-    /// Returns a type name of this `UserData` (from a metatable field).
-    pub(crate) fn type_name(&self) -> Result<Option<StdString>> {
+    /// Returns a type name of this userdata (from a metatable field).
+    ///
+    /// If no type name is set, returns `None`.
+    pub fn type_name(&self) -> Result<Option<String>> {
         let lua = self.0.lua.lock();
         let state = lua.state();
         unsafe {
@@ -939,7 +1060,7 @@ impl AnyUserData {
                 ffi::luaL_getmetafield(state, -1, MetaMethod::Type.as_cstr().as_ptr())
             };
             match name_type {
-                ffi::LUA_TSTRING => Ok(Some(String(lua.pop_ref()).to_str()?.to_owned())),
+                ffi::LUA_TSTRING => Ok(Some(LuaString(lua.pop_ref()).to_str()?.to_owned())),
                 _ => Ok(None),
             }
         }
@@ -975,6 +1096,46 @@ impl AnyUserData {
             Ok::<_, Error>((*ud).is_serializable())
         };
         is_serializable().unwrap_or(false)
+    }
+
+    unsafe fn invoke_tostring_dbg(&self) -> Result<Option<String>> {
+        let lua = self.0.lua.lock();
+        let state = lua.state();
+        let _guard = StackGuard::new(state);
+        check_stack(state, 3)?;
+
+        lua.push_ref(&self.0);
+        protect_lua!(state, 1, 1, fn(state) {
+            // Try `__todebugstring` metamethod first, then `__tostring`
+            #[allow(clippy::collapsible_if)]
+            if ffi::luaL_callmeta(state, -1, cstr!("__todebugstring")) == 0 {
+                if ffi::luaL_callmeta(state, -1, cstr!("__tostring")) == 0 {
+                    ffi::lua_pushnil(state);
+                }
+            }
+        })?;
+        Ok(lua.pop_value().as_string().map(|s| s.to_string_lossy()))
+    }
+
+    pub(crate) fn fmt_pretty(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        // Try converting to a (debug) string first, with fallback to `__name/__type`
+        match unsafe { self.invoke_tostring_dbg() } {
+            Ok(Some(s)) => write!(fmt, "{s}"),
+            _ => {
+                let name = self.type_name().ok().flatten();
+                let name = name.as_deref().unwrap_or("userdata");
+                write!(fmt, "{name}: {:?}", self.to_pointer())
+            }
+        }
+    }
+}
+
+impl fmt::Debug for AnyUserData {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        if fmt.alternate() {
+            return self.fmt_pretty(fmt);
+        }
+        fmt.debug_tuple("AnyUserData").field(&self.0).finish()
     }
 }
 
@@ -1026,13 +1187,13 @@ impl UserDataMetatable {
 /// It skips restricted metamethods, such as `__gc` or `__metatable`.
 ///
 /// This struct is created by the [`UserDataMetatable::pairs`] method.
-pub struct UserDataMetatablePairs<'a, V>(TablePairs<'a, StdString, V>);
+pub struct UserDataMetatablePairs<'a, V>(TablePairs<'a, String, V>);
 
 impl<V> Iterator for UserDataMetatablePairs<'_, V>
 where
     V: FromLua,
 {
-    type Item = Result<(StdString, V)>;
+    type Item = Result<(String, V)>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -1072,7 +1233,7 @@ impl AnyUserData {
     /// Wraps any Rust type, returning an opaque type that implements [`IntoLua`] trait.
     ///
     /// This function uses [`Lua::create_any_userdata`] under the hood.
-    pub fn wrap<T: MaybeSend + 'static>(data: T) -> impl IntoLua {
+    pub fn wrap<T: MaybeSend + MaybeSync + 'static>(data: T) -> impl IntoLua {
         WrappedUserdata(move |lua| lua.create_any_userdata(data))
     }
 
@@ -1082,7 +1243,7 @@ impl AnyUserData {
     /// This function uses [`Lua::create_ser_any_userdata`] under the hood.
     #[cfg(feature = "serde")]
     #[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
-    pub fn wrap_ser<T: Serialize + MaybeSend + 'static>(data: T) -> impl IntoLua {
+    pub fn wrap_ser<T: Serialize + MaybeSend + MaybeSync + 'static>(data: T) -> impl IntoLua {
         WrappedUserdata(move |lua| lua.create_ser_any_userdata(data))
     }
 }

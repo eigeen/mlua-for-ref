@@ -1,3 +1,27 @@
+## v0.11.6 (Jan 27, 2026)
+
+- Added Lua 5.5 support (`lua55` feature flag)
+- Luau updated to 0.705+
+- Added `AnyUserData::is_proxy` method to check if userdata is a proxy
+- Added `num_params`, `num_upvalues`, `is_vararg` to `FunctionInfo`
+
+## v0.11.5 (Nov 22, 2025)
+
+- Luau updated to 0.701
+- Added `Lua::set_memory_category` and `Lua::heap_dump` functions to profile (Luau) memory
+- Added `Lua::type_metatable` helper to get metatable of a primitive type
+- Added `Lua::traceback` function to generate stack traces at different levels
+- Added `add_method_once` /`add_async_method_once` UserData methods (experimental)
+- Make `AnyUserData::type_name` public
+- impl `IntoLuaMulti` for `&MultiValue`
+- Bugfixes and async perf improvements
+
+## v0.11.4 (Sep 29, 2025)
+
+- Make `Value::to_serializable` public
+- Add new serde option `detect_mixed_tables` (to encode mixed array+map tables)
+- Add `ObjectLike::get_path` helper (for tables and userdata)
+
 ## v0.11.3 (Aug 30, 2025)
 
 - Add `Lua::yield_with` to use as `coroutine.yield` functional replacement in async functions for any Lua

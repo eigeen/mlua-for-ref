@@ -2,15 +2,15 @@ use std::any::Any;
 use std::fmt::Write as _;
 use std::mem::MaybeUninit;
 use std::os::raw::{c_int, c_void};
-use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::ptr;
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::memory::MemoryState;
 use crate::util::{
-    check_stack, get_internal_userdata, init_internal_metatable, push_internal_userdata, push_string,
-    push_table, rawset_field, to_string, TypeKey, DESTRUCTED_USERDATA_METATABLE,
+    DESTRUCTED_USERDATA_METATABLE, TypeKey, check_stack, get_internal_userdata, init_internal_metatable,
+    push_internal_userdata, push_string, push_table, rawset_field, to_string,
 };
 
 static WRAPPED_FAILURE_TYPE_KEY: u8 = 0;
@@ -208,7 +208,7 @@ where
         F: FnOnce(*mut ffi::lua_State) -> R,
         R: Copy,
     {
-        let params = ffi::lua_touserdata(state, -1) as *mut Params<F, R>;
+        let params = ffi::lua_tolightuserdata(state, -1) as *mut Params<F, R>;
         ffi::lua_pop(state, 1);
 
         let f = (*params).function.take().unwrap();
@@ -239,7 +239,7 @@ where
 
     ffi::lua_pushlightuserdata(state, &mut params as *mut Params<F, R> as *mut c_void);
     let ret = ffi::lua_pcall(state, nargs + 1, nresults, stack_start + 1);
-    ffi::lua_remove(state, stack_start + 1);
+    ffi::lua_remove(state, stack_start + 1); // remove error handler
 
     if ret == ffi::LUA_OK {
         // `LUA_OK` is only returned when the `do_call` function has completed successfully, so
@@ -373,19 +373,19 @@ pub(crate) unsafe fn init_error_registry(state: *mut ffi::lua_State) -> Result<(
         "__mod",
         "__pow",
         "__unm",
-        #[cfg(any(feature = "lua54", feature = "lua53", feature = "luau"))]
+        #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53", feature = "luau"))]
         "__idiv",
-        #[cfg(any(feature = "lua54", feature = "lua53"))]
+        #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53"))]
         "__band",
-        #[cfg(any(feature = "lua54", feature = "lua53"))]
+        #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53"))]
         "__bor",
-        #[cfg(any(feature = "lua54", feature = "lua53"))]
+        #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53"))]
         "__bxor",
-        #[cfg(any(feature = "lua54", feature = "lua53"))]
+        #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53"))]
         "__bnot",
-        #[cfg(any(feature = "lua54", feature = "lua53"))]
+        #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53"))]
         "__shl",
-        #[cfg(any(feature = "lua54", feature = "lua53"))]
+        #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53"))]
         "__shr",
         "__concat",
         "__len",
@@ -396,7 +396,13 @@ pub(crate) unsafe fn init_error_registry(state: *mut ffi::lua_State) -> Result<(
         "__newindex",
         "__call",
         "__tostring",
-        #[cfg(any(feature = "lua54", feature = "lua53", feature = "lua52", feature = "luajit52"))]
+        #[cfg(any(
+            feature = "lua55",
+            feature = "lua54",
+            feature = "lua53",
+            feature = "lua52",
+            feature = "luajit52"
+        ))]
         "__pairs",
         #[cfg(any(feature = "lua53", feature = "lua52", feature = "luajit52"))]
         "__ipairs",
@@ -404,7 +410,7 @@ pub(crate) unsafe fn init_error_registry(state: *mut ffi::lua_State) -> Result<(
         "__iter",
         #[cfg(feature = "luau")]
         "__namecall",
-        #[cfg(feature = "lua54")]
+        #[cfg(any(feature = "lua55", feature = "lua54"))]
         "__close",
     ] {
         ffi::lua_pushvalue(state, -1);

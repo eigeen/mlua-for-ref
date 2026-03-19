@@ -1,3 +1,8 @@
+//! Lua state management.
+//!
+//! This module provides the main [`Lua`] state handle together with state-specific
+//! configuration and garbage collector controls.
+
 use std::any::TypeId;
 use std::cell::{BorrowError, BorrowMutError, RefCell};
 use std::marker::PhantomData;
@@ -15,16 +20,16 @@ use crate::memory::MemoryState;
 use crate::multi::MultiValue;
 use crate::scope::Scope;
 use crate::stdlib::StdLib;
-use crate::string::String;
+use crate::string::LuaString;
 use crate::table::Table;
 use crate::thread::Thread;
 use crate::traits::{FromLua, FromLuaMulti, IntoLua, IntoLuaMulti};
 use crate::types::{
-    AppDataRef, AppDataRefMut, ArcReentrantMutexGuard, Integer, LuaType, MaybeSend, Number, ReentrantMutex,
-    ReentrantMutexGuard, RegistryKey, VmState, XRc, XWeak,
+    AppDataRef, AppDataRefMut, ArcReentrantMutexGuard, Integer, LuaType, MaybeSend, MaybeSync, Number,
+    ReentrantMutex, ReentrantMutexGuard, RegistryKey, VmState, XRc, XWeak,
 };
 use crate::userdata::{AnyUserData, UserData, UserDataProxy, UserDataRegistry, UserDataStorage};
-use crate::util::{assert_stack, check_stack, protect_lua_closure, push_string, rawset_field, StackGuard};
+use crate::util::{StackGuard, assert_stack, check_stack, protect_lua_closure, push_string, rawset_field};
 use crate::value::{Nil, Value};
 
 #[cfg(not(feature = "luau"))]
@@ -44,6 +49,7 @@ use {
 use serde::Serialize;
 
 pub(crate) use extra::ExtraData;
+#[doc(hidden)]
 pub use raw::RawLua;
 pub(crate) use util::callback_error_ext;
 
@@ -62,20 +68,126 @@ pub struct WeakLua(XWeak<ReentrantMutex<RawLua>>);
 
 pub(crate) struct LuaGuard(ArcReentrantMutexGuard<RawLua>);
 
-/// Mode of the Lua garbage collector (GC).
-///
-/// In Lua 5.4 GC can work in two modes: incremental and generational.
-/// Previous Lua versions support only incremental GC.
+/// Tuning parameters for the incremental GC collector.
 ///
 /// More information can be found in the Lua [documentation].
 ///
-/// [documentation]: https://www.lua.org/manual/5.4/manual.html#2.5
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GCMode {
-    Incremental,
-    #[cfg(feature = "lua54")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "lua54")))]
-    Generational,
+/// [documentation]: https://www.lua.org/manual/5.5/manual.html#2.5.1
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GcIncParams {
+    /// Pause between successive GC cycles, expressed as a percentage of live memory.
+    #[cfg(not(feature = "luau"))]
+    #[cfg_attr(docsrs, doc(cfg(not(feature = "luau"))))]
+    pub pause: Option<c_int>,
+
+    /// Target heap size as a percentage of live data, controlling how aggressively
+    /// the GC reclaims memory (`LUA_GCSETGOAL`).
+    #[cfg(any(feature = "luau", doc))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "luau")))]
+    pub goal: Option<c_int>,
+
+    /// GC work performed per unit of memory allocated.
+    pub step_multiplier: Option<c_int>,
+
+    /// Granularity of each GC step in kilobytes.
+    #[cfg(any(feature = "lua55", feature = "lua54", feature = "luau"))]
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "lua55", feature = "lua54", feature = "luau"))))]
+    pub step_size: Option<c_int>,
+}
+
+impl GcIncParams {
+    /// Sets the `pause` parameter.
+    #[cfg(not(feature = "luau"))]
+    #[cfg_attr(docsrs, doc(cfg(not(feature = "luau"))))]
+    pub fn pause(mut self, v: c_int) -> Self {
+        self.pause = Some(v);
+        self
+    }
+
+    /// Sets the `goal` parameter.
+    #[cfg(any(feature = "luau", doc))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "luau")))]
+    pub fn goal(mut self, v: c_int) -> Self {
+        self.goal = Some(v);
+        self
+    }
+
+    /// Sets the `step_multiplier` parameter.
+    pub fn step_multiplier(mut self, v: c_int) -> Self {
+        self.step_multiplier = Some(v);
+        self
+    }
+
+    /// Sets the `step_size` parameter.
+    #[cfg(any(feature = "lua55", feature = "lua54", feature = "luau"))]
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "lua55", feature = "lua54", feature = "luau"))))]
+    pub fn step_size(mut self, v: c_int) -> Self {
+        self.step_size = Some(v);
+        self
+    }
+}
+
+/// Tuning parameters for the generational GC collector (Lua 5.4+).
+///
+/// More information can be found in the Lua [documentation].
+///
+/// [documentation]: https://www.lua.org/manual/5.5/manual.html#2.5.2
+#[cfg(any(feature = "lua55", feature = "lua54"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "lua55", feature = "lua54"))))]
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GcGenParams {
+    /// Frequency of minor (young-generation) collection steps.
+    pub minor_multiplier: Option<c_int>,
+
+    /// Threshold controlling how large the young generation can grow before triggering
+    /// a shift from minor to major collection.
+    pub minor_to_major: Option<c_int>,
+
+    /// Threshold controlling how much the major collection must shrink the heap before
+    /// switching back to minor (young-generation) collection.
+    #[cfg(feature = "lua55")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "lua55")))]
+    pub major_to_minor: Option<c_int>,
+}
+
+#[cfg(any(feature = "lua55", feature = "lua54"))]
+impl GcGenParams {
+    /// Sets the `minor_multiplier` parameter.
+    pub fn minor_multiplier(mut self, v: c_int) -> Self {
+        self.minor_multiplier = Some(v);
+        self
+    }
+
+    /// Sets the `minor_to_major` threshold.
+    pub fn minor_to_major(mut self, v: c_int) -> Self {
+        self.minor_to_major = Some(v);
+        self
+    }
+
+    /// Sets the `major_to_minor` parameter.
+    #[cfg(feature = "lua55")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "lua55")))]
+    pub fn major_to_minor(mut self, v: c_int) -> Self {
+        self.major_to_minor = Some(v);
+        self
+    }
+}
+
+/// Lua garbage collector (GC) operating mode.
+///
+/// Use [`Lua::gc_set_mode`] to switch the collector mode and/or tune its parameters.
+#[non_exhaustive]
+#[derive(Clone, Debug)]
+pub enum GcMode {
+    /// Incremental mark-and-sweep
+    Incremental(GcIncParams),
+
+    /// Generational
+    #[cfg(any(feature = "lua55", feature = "lua54"))]
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "lua55", feature = "lua54"))))]
+    Generational(GcGenParams),
 }
 
 /// Controls Lua interpreter behavior such as Rust panics handling.
@@ -249,7 +361,7 @@ impl Lua {
             ffi::luaL_loadstring as _,
             ffi::luaL_openlibs as _,
         ]);
-        #[cfg(any(feature = "lua54", feature = "lua53", feature = "lua52"))]
+        #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53", feature = "lua52"))]
         {
             _symbols.push(ffi::lua_getglobal as _);
             _symbols.push(ffi::lua_setglobal as _);
@@ -337,6 +449,39 @@ impl Lua {
         R::from_stack_multi(nresults, &lua)
     }
 
+    /// Runs callback with the inner RawLua value. It can be used to manually push and get values on
+    /// the stack.
+    ///
+    /// This function is safe because all unsafe actions with RawLua can only be done with unsafe
+    ///
+    /// # Example
+    /// ```
+    /// # use mlua::{Lua, Result, FromLua, IntoLua};
+    /// # fn main() -> Result<()> {
+    /// let lua = Lua::new();
+    /// let n: i32 = {
+    ///     let num = 11i32;
+    ///     lua.exec_raw_lua(|lua| {
+    ///         unsafe {
+    ///             <i32 as IntoLua>::push_into_stack(num, lua)?;
+    ///         }
+    ///
+    ///         let n = unsafe {
+    ///             <i32 as FromLua>::from_stack(-1, lua)?
+    ///         };
+    ///         Result::Ok(n)
+    ///     })
+    /// }?;
+    /// assert_eq!(n, 11);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[doc(hidden)]
+    pub fn exec_raw_lua<R>(&self, f: impl FnOnce(&RawLua) -> R) -> R {
+        let lua = self.lock();
+        f(&lua)
+    }
+
     /// Loads the specified subset of the standard libraries into an existing Lua state.
     ///
     /// Use the [`StdLib`] flags to specify the libraries you want to load.
@@ -382,7 +527,7 @@ impl Lua {
     #[cfg(not(feature = "luau"))]
     #[cfg_attr(docsrs, doc(cfg(not(feature = "luau"))))]
     pub fn preload_module(&self, modname: &str, func: Function) -> Result<()> {
-        #[cfg(any(feature = "lua54", feature = "lua53", feature = "lua52"))]
+        #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53", feature = "lua52"))]
         let preload = unsafe {
             self.exec_raw::<Option<Table>>((), |state| {
                 ffi::lua_getfield(state, ffi::LUA_REGISTRYINDEX, ffi::LUA_PRELOAD_TABLE);
@@ -814,15 +959,14 @@ impl Lua {
     }
 
     /// Sets the warning function to be used by Lua to emit warnings.
-    #[cfg(feature = "lua54")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "lua54")))]
+    #[cfg(any(feature = "lua55", feature = "lua54"))]
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "lua55", feature = "lua54"))))]
     pub fn set_warning_function<F>(&self, callback: F)
     where
         F: Fn(&Lua, &str, bool) -> Result<()> + MaybeSend + 'static,
     {
         use std::ffi::CStr;
         use std::os::raw::{c_char, c_void};
-        use std::string::String as StdString;
 
         unsafe extern "C-unwind" fn warn_proc(ud: *mut c_void, msg: *const c_char, tocont: c_int) {
             let extra = ud as *mut ExtraData;
@@ -832,7 +976,7 @@ impl Lua {
                 if XRc::strong_count(&warn_callback) > 2 {
                     return Ok(());
                 }
-                let msg = StdString::from_utf8_lossy(CStr::from_ptr(msg).to_bytes());
+                let msg = String::from_utf8_lossy(CStr::from_ptr(msg).to_bytes());
                 warn_callback((*extra).lua(), &msg, tocont != 0)
             });
         }
@@ -847,8 +991,8 @@ impl Lua {
     /// Removes warning function previously set by `set_warning_function`.
     ///
     /// This function has no effect if a warning function was not previously set.
-    #[cfg(feature = "lua54")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "lua54")))]
+    #[cfg(any(feature = "lua55", feature = "lua54"))]
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "lua55", feature = "lua54"))))]
     pub fn remove_warning_function(&self) {
         let lua = self.lock();
         unsafe {
@@ -861,8 +1005,8 @@ impl Lua {
     ///
     /// A message in a call with `incomplete` set to `true` should be continued in
     /// another call to this function.
-    #[cfg(feature = "lua54")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "lua54")))]
+    #[cfg(any(feature = "lua55", feature = "lua54"))]
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "lua55", feature = "lua54"))))]
     pub fn warning(&self, msg: impl AsRef<str>, incomplete: bool) {
         let msg = msg.as_ref();
         let mut bytes = vec![0; msg.len() + 1];
@@ -875,10 +1019,10 @@ impl Lua {
         }
     }
 
-    /// Gets information about the interpreter runtime stack at a given level.
+    /// Gets information about the interpreter runtime stack at the given level.
     ///
-    /// This function calls callback `f`, passing the [`Debug`] structure that can be used to get
-    /// information about the function executing at a given level.
+    /// This function calls callback `f`, passing the [`struct@Debug`] structure that can be used to
+    /// get information about the function executing at a given level.
     /// Level `0` is the current running function, whereas level `n+1` is the function that has
     /// called level `n` (except for tail calls, which do not count in the stack).
     pub fn inspect_stack<R>(&self, level: usize, f: impl FnOnce(&Debug) -> R) -> Option<R> {
@@ -896,6 +1040,26 @@ impl Lua {
             }
 
             Some(f(&Debug::new(&lua, level, &mut ar)))
+        }
+    }
+
+    /// Creates a traceback of the call stack at the given level.
+    ///
+    /// The `msg` parameter, if provided, is added at the beginning of the traceback.
+    /// The `level` parameter works the same way as in [`Lua::inspect_stack`].
+    pub fn traceback(&self, msg: Option<&str>, level: usize) -> Result<LuaString> {
+        let lua = self.lock();
+        unsafe {
+            check_stack(lua.state(), 3)?;
+            protect_lua!(lua.state(), 0, 1, |state| {
+                let msg = match msg {
+                    Some(s) => ffi::lua_pushlstring(state, s.as_ptr() as *const c_char, s.len()),
+                    None => ptr::null(),
+                };
+                // `protect_lua` adds it's own call frame, so we need to increase level by 1
+                ffi::luaL_traceback(state, state, msg, (level + 1) as c_int);
+            })?;
+            Ok(LuaString(lua.pop_ref()))
         }
     }
 
@@ -934,25 +1098,31 @@ impl Lua {
     }
 
     /// Returns `true` if the garbage collector is currently running automatically.
-    #[cfg(any(feature = "lua54", feature = "lua53", feature = "lua52", feature = "luau"))]
+    #[cfg(any(
+        feature = "lua55",
+        feature = "lua54",
+        feature = "lua53",
+        feature = "lua52",
+        feature = "luau"
+    ))]
     pub fn gc_is_running(&self) -> bool {
         let lua = self.lock();
         unsafe { ffi::lua_gc(lua.main_state(), ffi::LUA_GCISRUNNING, 0) != 0 }
     }
 
-    /// Stop the Lua GC from running
+    /// Stops the Lua GC from running.
     pub fn gc_stop(&self) {
         let lua = self.lock();
         unsafe { ffi::lua_gc(lua.main_state(), ffi::LUA_GCSTOP, 0) };
     }
 
-    /// Restarts the Lua GC if it is not running
+    /// Restarts the Lua GC if it is not running.
     pub fn gc_restart(&self) {
         let lua = self.lock();
         unsafe { ffi::lua_gc(lua.main_state(), ffi::LUA_GCRESTART, 0) };
     }
 
-    /// Perform a full garbage-collection cycle.
+    /// Performs a full garbage-collection cycle.
     ///
     /// It may be necessary to call this function twice to collect all currently unreachable
     /// objects. Once to finish the current gc cycle, and once to start and finish the next cycle.
@@ -965,123 +1135,128 @@ impl Lua {
         }
     }
 
-    /// Steps the garbage collector one indivisible step.
+    /// Performs a basic step of garbage collection.
     ///
-    /// Returns `true` if this has finished a collection cycle.
+    /// In incremental mode, a basic step corresponds to the current step size. In generational
+    /// mode, a basic step performs a full minor collection or an incremental step, if the collector
+    /// has scheduled one.
+    ///
+    /// In incremental mode, returns `true` if this step has finished a collection cycle.
+    /// In generational mode, returns `true` if the step finished a major collection.
     pub fn gc_step(&self) -> Result<bool> {
-        self.gc_step_kbytes(0)
-    }
-
-    /// Steps the garbage collector as though memory had been allocated.
-    ///
-    /// if `kbytes` is 0, then this is the same as calling `gc_step`. Returns true if this step has
-    /// finished a collection cycle.
-    pub fn gc_step_kbytes(&self, kbytes: c_int) -> Result<bool> {
         let lua = self.lock();
         let state = lua.main_state();
         unsafe {
             check_stack(state, 3)?;
             protect_lua!(state, 0, 0, |state| {
-                ffi::lua_gc(state, ffi::LUA_GCSTEP, kbytes) != 0
+                ffi::lua_gc(state, ffi::LUA_GCSTEP, 0) != 0
             })
         }
     }
 
-    /// Sets the `pause` value of the collector.
+    /// Switches the GC to the given mode with the provided parameters.
     ///
-    /// Returns the previous value of `pause`. More information can be found in the Lua
-    /// [documentation].
+    /// Returns the previous [`GcMode`]. The returned value's parameter fields are always
+    /// `None` because Lua's C API does not provide a way to read back current parameter values
+    /// without changing them.
     ///
-    /// For Luau this parameter sets GC goal
+    /// # Examples
     ///
-    /// [documentation]: https://www.lua.org/manual/5.4/manual.html#2.5
-    pub fn gc_set_pause(&self, pause: c_int) -> c_int {
+    /// Switch to generational mode (Lua 5.4+):
+    /// ```ignore
+    /// let prev = lua.gc_set_mode(GcMode::Generational(GcGenParams::default()));
+    /// ```
+    ///
+    /// Switch to incremental mode with custom parameters:
+    /// ```ignore
+    /// lua.gc_set_mode(GcMode::Incremental(
+    ///     GcIncParams::default().pause(200).step_multiplier(100)
+    /// ));
+    /// ```
+    pub fn gc_set_mode(&self, mode: GcMode) -> GcMode {
         let lua = self.lock();
         let state = lua.main_state();
-        unsafe {
-            #[cfg(not(feature = "luau"))]
-            return ffi::lua_gc(state, ffi::LUA_GCSETPAUSE, pause);
+
+        match mode {
+            #[cfg(feature = "lua55")]
+            GcMode::Incremental(params) => unsafe {
+                if let Some(v) = params.pause {
+                    ffi::lua_gc(state, ffi::LUA_GCPARAM, ffi::LUA_GCPPAUSE, v);
+                }
+                if let Some(v) = params.step_multiplier {
+                    ffi::lua_gc(state, ffi::LUA_GCPARAM, ffi::LUA_GCPSTEPMUL, v);
+                }
+                if let Some(v) = params.step_size {
+                    ffi::lua_gc(state, ffi::LUA_GCPARAM, ffi::LUA_GCPSTEPSIZE, v);
+                }
+                match ffi::lua_gc(state, ffi::LUA_GCINC) {
+                    ffi::LUA_GCINC => GcMode::Incremental(GcIncParams::default()),
+                    ffi::LUA_GCGEN => GcMode::Generational(GcGenParams::default()),
+                    _ => unreachable!(),
+                }
+            },
+            #[cfg(feature = "lua54")]
+            GcMode::Incremental(params) => unsafe {
+                let pause = params.pause.unwrap_or(0);
+                let step_mul = params.step_multiplier.unwrap_or(0);
+                let step_size = params.step_size.unwrap_or(0);
+                match ffi::lua_gc(state, ffi::LUA_GCINC, pause, step_mul, step_size) {
+                    ffi::LUA_GCINC => GcMode::Incremental(GcIncParams::default()),
+                    ffi::LUA_GCGEN => GcMode::Generational(GcGenParams::default()),
+                    _ => unreachable!(),
+                }
+            },
+            #[cfg(any(feature = "lua53", feature = "lua52", feature = "lua51", feature = "luajit"))]
+            GcMode::Incremental(params) => unsafe {
+                if let Some(v) = params.pause {
+                    ffi::lua_gc(state, ffi::LUA_GCSETPAUSE, v);
+                }
+                if let Some(v) = params.step_multiplier {
+                    ffi::lua_gc(state, ffi::LUA_GCSETSTEPMUL, v);
+                }
+                GcMode::Incremental(GcIncParams::default())
+            },
             #[cfg(feature = "luau")]
-            return ffi::lua_gc(state, ffi::LUA_GCSETGOAL, pause);
-        }
-    }
+            GcMode::Incremental(params) => unsafe {
+                if let Some(v) = params.goal {
+                    ffi::lua_gc(state, ffi::LUA_GCSETGOAL, v);
+                }
+                if let Some(v) = params.step_multiplier {
+                    ffi::lua_gc(state, ffi::LUA_GCSETSTEPMUL, v);
+                }
+                if let Some(v) = params.step_size {
+                    ffi::lua_gc(state, ffi::LUA_GCSETSTEPSIZE, v);
+                }
+                GcMode::Incremental(GcIncParams::default())
+            },
 
-    /// Sets the `step multiplier` value of the collector.
-    ///
-    /// Returns the previous value of the `step multiplier`. More information can be found in the
-    /// Lua [documentation].
-    ///
-    /// [documentation]: https://www.lua.org/manual/5.4/manual.html#2.5
-    pub fn gc_set_step_multiplier(&self, step_multiplier: c_int) -> c_int {
-        let lua = self.lock();
-        unsafe { ffi::lua_gc(lua.main_state(), ffi::LUA_GCSETSTEPMUL, step_multiplier) }
-    }
-
-    /// Changes the collector to incremental mode with the given parameters.
-    ///
-    /// Returns the previous mode (always `GCMode::Incremental` in Lua < 5.4).
-    /// More information can be found in the Lua [documentation].
-    ///
-    /// [documentation]: https://www.lua.org/manual/5.4/manual.html#2.5.1
-    pub fn gc_inc(&self, pause: c_int, step_multiplier: c_int, step_size: c_int) -> GCMode {
-        let lua = self.lock();
-        let state = lua.main_state();
-
-        #[cfg(any(
-            feature = "lua53",
-            feature = "lua52",
-            feature = "lua51",
-            feature = "luajit",
-            feature = "luau"
-        ))]
-        unsafe {
-            if pause > 0 {
-                #[cfg(not(feature = "luau"))]
-                ffi::lua_gc(state, ffi::LUA_GCSETPAUSE, pause);
-                #[cfg(feature = "luau")]
-                ffi::lua_gc(state, ffi::LUA_GCSETGOAL, pause);
-            }
-
-            if step_multiplier > 0 {
-                ffi::lua_gc(state, ffi::LUA_GCSETSTEPMUL, step_multiplier);
-            }
-
-            #[cfg(feature = "luau")]
-            if step_size > 0 {
-                ffi::lua_gc(state, ffi::LUA_GCSETSTEPSIZE, step_size);
-            }
-            #[cfg(not(feature = "luau"))]
-            let _ = step_size; // Ignored
-
-            GCMode::Incremental
-        }
-
-        #[cfg(feature = "lua54")]
-        let prev_mode = unsafe { ffi::lua_gc(state, ffi::LUA_GCINC, pause, step_multiplier, step_size) };
-        #[cfg(feature = "lua54")]
-        match prev_mode {
-            ffi::LUA_GCINC => GCMode::Incremental,
-            ffi::LUA_GCGEN => GCMode::Generational,
-            _ => unreachable!(),
-        }
-    }
-
-    /// Changes the collector to generational mode with the given parameters.
-    ///
-    /// Returns the previous mode. More information about the generational GC
-    /// can be found in the Lua 5.4 [documentation][lua_doc].
-    ///
-    /// [lua_doc]: https://www.lua.org/manual/5.4/manual.html#2.5.2
-    #[cfg(feature = "lua54")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "lua54")))]
-    pub fn gc_gen(&self, minor_multiplier: c_int, major_multiplier: c_int) -> GCMode {
-        let lua = self.lock();
-        let state = lua.main_state();
-        let prev_mode = unsafe { ffi::lua_gc(state, ffi::LUA_GCGEN, minor_multiplier, major_multiplier) };
-        match prev_mode {
-            ffi::LUA_GCGEN => GCMode::Generational,
-            ffi::LUA_GCINC => GCMode::Incremental,
-            _ => unreachable!(),
+            #[cfg(feature = "lua55")]
+            GcMode::Generational(params) => unsafe {
+                if let Some(v) = params.minor_multiplier {
+                    ffi::lua_gc(state, ffi::LUA_GCPARAM, ffi::LUA_GCPMINORMUL, v);
+                }
+                if let Some(v) = params.minor_to_major {
+                    ffi::lua_gc(state, ffi::LUA_GCPARAM, ffi::LUA_GCPMINORMAJOR, v);
+                }
+                if let Some(v) = params.major_to_minor {
+                    ffi::lua_gc(state, ffi::LUA_GCPARAM, ffi::LUA_GCPMAJORMINOR, v);
+                }
+                match ffi::lua_gc(state, ffi::LUA_GCGEN) {
+                    ffi::LUA_GCGEN => GcMode::Generational(GcGenParams::default()),
+                    ffi::LUA_GCINC => GcMode::Incremental(GcIncParams::default()),
+                    _ => unreachable!(),
+                }
+            },
+            #[cfg(feature = "lua54")]
+            GcMode::Generational(params) => unsafe {
+                let minor = params.minor_multiplier.unwrap_or(0);
+                let minor_to_major = params.minor_to_major.unwrap_or(0);
+                match ffi::lua_gc(state, ffi::LUA_GCGEN, minor, minor_to_major) {
+                    ffi::LUA_GCGEN => GcMode::Generational(GcGenParams::default()),
+                    ffi::LUA_GCINC => GcMode::Incremental(GcIncParams::default()),
+                    _ => unreachable!(),
+                }
+            },
         }
     }
 
@@ -1116,10 +1291,10 @@ impl Lua {
     #[doc(hidden)]
     #[allow(clippy::result_unit_err)]
     pub fn set_fflag(name: &str, enabled: bool) -> StdResult<(), ()> {
-        if let Ok(name) = std::ffi::CString::new(name) {
-            if unsafe { ffi::luau_setfflag(name.as_ptr(), enabled as c_int) != 0 } {
-                return Ok(());
-            }
+        if let Ok(name) = std::ffi::CString::new(name)
+            && unsafe { ffi::luau_setfflag(name.as_ptr(), enabled as c_int) != 0 }
+        {
+            return Ok(());
         }
         Err(())
     }
@@ -1159,8 +1334,19 @@ impl Lua {
     /// Lua strings can be arbitrary `[u8]` data including embedded nulls, so in addition to `&str`
     /// and `&String`, you can also pass plain `&[u8]` here.
     #[inline]
-    pub fn create_string(&self, s: impl AsRef<[u8]>) -> Result<String> {
-        unsafe { self.lock().create_string(s) }
+    pub fn create_string(&self, s: impl AsRef<[u8]>) -> Result<LuaString> {
+        unsafe { self.lock().create_string(s.as_ref()) }
+    }
+
+    /// Creates and returns an external Lua string.
+    ///
+    /// External string is a string where the memory is managed by Rust code, and Lua only holds a
+    /// reference to it. This can be used to avoid copying large strings into Lua memory.
+    #[cfg(feature = "lua55")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "lua55")))]
+    #[inline]
+    pub fn create_external_string(&self, s: impl Into<Vec<u8>>) -> Result<LuaString> {
+        unsafe { self.lock().create_external_string(s.into()) }
     }
 
     /// Creates and returns a Luau [buffer] object from a byte slice of data.
@@ -1297,7 +1483,12 @@ impl Lua {
     /// This function is unsafe because provides a way to execute unsafe C function.
     pub unsafe fn create_c_function(&self, func: ffi::lua_CFunction) -> Result<Function> {
         let lua = self.lock();
-        if cfg!(any(feature = "lua54", feature = "lua53", feature = "lua52")) {
+        if cfg!(any(
+            feature = "lua55",
+            feature = "lua54",
+            feature = "lua53",
+            feature = "lua52"
+        )) {
             ffi::lua_pushcfunction(lua.ref_thread(), func);
             return Ok(Function(lua.pop_ref_thread()));
         }
@@ -1352,7 +1543,7 @@ impl Lua {
     /// }
     /// ```
     ///
-    /// [`AsyncThread`]: crate::AsyncThread
+    /// [`AsyncThread`]: crate::thread::AsyncThread
     #[cfg(feature = "async")]
     #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
     pub fn create_async_function<F, A, FR, R>(&self, func: F) -> Result<Function>
@@ -1388,7 +1579,7 @@ impl Lua {
     #[inline]
     pub fn create_userdata<T>(&self, data: T) -> Result<AnyUserData>
     where
-        T: UserData + MaybeSend + 'static,
+        T: UserData + MaybeSend + MaybeSync + 'static,
     {
         unsafe { self.lock().make_userdata(UserDataStorage::new(data)) }
     }
@@ -1399,7 +1590,7 @@ impl Lua {
     #[inline]
     pub fn create_ser_userdata<T>(&self, data: T) -> Result<AnyUserData>
     where
-        T: UserData + Serialize + MaybeSend + 'static,
+        T: UserData + Serialize + MaybeSend + MaybeSync + 'static,
     {
         unsafe { self.lock().make_userdata(UserDataStorage::new_ser(data)) }
     }
@@ -1414,7 +1605,7 @@ impl Lua {
     #[inline]
     pub fn create_any_userdata<T>(&self, data: T) -> Result<AnyUserData>
     where
-        T: MaybeSend + 'static,
+        T: MaybeSend + MaybeSync + 'static,
     {
         unsafe { self.lock().make_any_userdata(UserDataStorage::new(data)) }
     }
@@ -1427,7 +1618,7 @@ impl Lua {
     #[inline]
     pub fn create_ser_any_userdata<T>(&self, data: T) -> Result<AnyUserData>
     where
-        T: Serialize + MaybeSend + 'static,
+        T: Serialize + MaybeSend + MaybeSync + 'static,
     {
         unsafe { (self.lock()).make_any_userdata(UserDataStorage::new_ser(data)) }
     }
@@ -1494,7 +1685,27 @@ impl Lua {
         unsafe { self.lock().make_userdata(UserDataStorage::new(ud)) }
     }
 
-    /// Sets the metatable for a Lua builtin type.
+    /// Gets the metatable of a Lua built-in (primitive) type.
+    ///
+    /// The metatable is shared by all values of the given type.
+    ///
+    /// See [`Lua::set_type_metatable`] for examples.
+    #[allow(private_bounds)]
+    pub fn type_metatable<T: LuaType>(&self) -> Option<Table> {
+        let lua = self.lock();
+        let state = lua.state();
+        unsafe {
+            let _sg = StackGuard::new(state);
+            assert_stack(state, 2);
+
+            if lua.push_primitive_type::<T>() && ffi::lua_getmetatable(state, -1) != 0 {
+                return Some(Table(lua.pop_ref()));
+            }
+        }
+        None
+    }
+
+    /// Sets the metatable for a Lua built-in (primitive) type.
     ///
     /// The metatable will be shared by all values of the given type.
     ///
@@ -1521,44 +1732,13 @@ impl Lua {
             let _sg = StackGuard::new(state);
             assert_stack(state, 2);
 
-            match T::TYPE_ID {
-                ffi::LUA_TBOOLEAN => {
-                    ffi::lua_pushboolean(state, 0);
+            if lua.push_primitive_type::<T>() {
+                match metatable {
+                    Some(metatable) => lua.push_ref(&metatable.0),
+                    None => ffi::lua_pushnil(state),
                 }
-                ffi::LUA_TLIGHTUSERDATA => {
-                    ffi::lua_pushlightuserdata(state, ptr::null_mut());
-                }
-                ffi::LUA_TNUMBER => {
-                    ffi::lua_pushnumber(state, 0.);
-                }
-                #[cfg(feature = "luau")]
-                ffi::LUA_TVECTOR => {
-                    #[cfg(not(feature = "luau-vector4"))]
-                    ffi::lua_pushvector(state, 0., 0., 0.);
-                    #[cfg(feature = "luau-vector4")]
-                    ffi::lua_pushvector(state, 0., 0., 0., 0.);
-                }
-                ffi::LUA_TSTRING => {
-                    ffi::lua_pushstring(state, b"\0" as *const u8 as *const _);
-                }
-                ffi::LUA_TFUNCTION => match self.load("function() end").eval::<Function>() {
-                    Ok(func) => lua.push_ref(&func.0),
-                    Err(_) => return,
-                },
-                ffi::LUA_TTHREAD => {
-                    ffi::lua_pushthread(state);
-                }
-                #[cfg(feature = "luau")]
-                ffi::LUA_TBUFFER => {
-                    ffi::lua_newbuffer(state, 0);
-                }
-                _ => return,
+                ffi::lua_setmetatable(state, -2);
             }
-            match metatable {
-                Some(metatable) => lua.push_ref(&metatable.0),
-                None => ffi::lua_pushnil(state),
-            }
-            ffi::lua_setmetatable(state, -2);
         }
     }
 
@@ -1569,7 +1749,7 @@ impl Lua {
         unsafe {
             let _sg = StackGuard::new(state);
             assert_stack(state, 1);
-            #[cfg(any(feature = "lua54", feature = "lua53", feature = "lua52"))]
+            #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53", feature = "lua52"))]
             ffi::lua_rawgeti(state, ffi::LUA_REGISTRYINDEX, ffi::LUA_RIDX_GLOBALS);
             #[cfg(any(feature = "lua51", feature = "luajit", feature = "luau"))]
             ffi::lua_pushvalue(state, ffi::LUA_GLOBALSINDEX);
@@ -1601,7 +1781,7 @@ impl Lua {
 
             lua.push_ref(&globals.0);
 
-            #[cfg(any(feature = "lua54", feature = "lua53", feature = "lua52"))]
+            #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53", feature = "lua52"))]
             ffi::lua_rawseti(state, ffi::LUA_REGISTRYINDEX, ffi::LUA_RIDX_GLOBALS);
             #[cfg(any(feature = "lua51", feature = "luajit", feature = "luau"))]
             ffi::lua_replace(state, ffi::LUA_GLOBALSINDEX);
@@ -1647,7 +1827,7 @@ impl Lua {
     ///
     /// To succeed, the value must be a string (in which case this is a no-op), an integer, or a
     /// number.
-    pub fn coerce_string(&self, v: Value) -> Result<Option<String>> {
+    pub fn coerce_string(&self, v: Value) -> Result<Option<LuaString>> {
         Ok(match v {
             Value::String(s) => Some(s),
             v => unsafe {
@@ -1665,7 +1845,7 @@ impl Lua {
                     })?
                 };
                 if !res.is_null() {
-                    Some(String(lua.pop_ref()))
+                    Some(LuaString(lua.pop_ref()))
                 } else {
                     None
                 }
@@ -1691,11 +1871,7 @@ impl Lua {
                 lua.push_value(&v)?;
                 let mut isint = 0;
                 let i = ffi::lua_tointegerx(state, -1, &mut isint);
-                if isint == 0 {
-                    None
-                } else {
-                    Some(i)
-                }
+                if isint == 0 { None } else { Some(i) }
             },
         })
     }
@@ -1717,11 +1893,7 @@ impl Lua {
                 lua.push_value(&v)?;
                 let mut isnum = 0;
                 let n = ffi::lua_tonumberx(state, -1, &mut isnum);
-                if isnum == 0 {
-                    None
-                } else {
-                    Some(n)
-                }
+                if isnum == 0 { None } else { Some(n) }
             },
         })
     }
@@ -2089,7 +2261,7 @@ impl Lua {
 
     /// Suspends the current async function, returning the provided arguments to caller.
     ///
-    /// This function is similar to [`coroutine.yield`] but allow yeilding Rust functions
+    /// This function is similar to [`coroutine.yield`] but allow yielding Rust functions
     /// and passing values to the caller.
     /// Please note that you cannot cross [`Thread`] boundaries (e.g. calling `yield_with` on one
     /// thread and resuming on another).
@@ -2167,9 +2339,13 @@ impl Lua {
             None => unsafe {
                 let lua = self.lock();
                 let state = lua.state();
-                let _sg = StackGuard::with_top(state, 0);
-                let nvals = ffi::lua_gettop(state);
-                Poll::Ready(R::from_stack_multi(nvals, &lua))
+                let top = ffi::lua_gettop(state);
+                if top == 0 || ffi::lua_type(state, 1) != ffi::LUA_TUSERDATA {
+                    // This must be impossible scenario if used correctly
+                    return Poll::Ready(R::from_stack_multi(0, &lua));
+                }
+                let _sg = StackGuard::with_top(state, 1);
+                Poll::Ready(R::from_stack_multi(top - 1, &lua))
             },
         })
         .await
@@ -2197,7 +2373,7 @@ impl Lua {
             })?,
         )?;
 
-        #[cfg(any(feature = "lua54", feature = "lua53", feature = "lua52"))]
+        #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53", feature = "lua52"))]
         let searchers: Table = package.get("searchers")?;
         #[cfg(any(feature = "lua51", feature = "luajit"))]
         let searchers: Table = package.get("loaders")?;

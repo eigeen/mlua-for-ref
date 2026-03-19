@@ -1,6 +1,5 @@
 #![cfg(feature = "async")]
 
-use std::string::String as StdString;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,7 +7,7 @@ use futures_util::stream::TryStreamExt;
 use tokio::sync::Mutex;
 
 use mlua::{
-    Error, Function, Lua, LuaOptions, MultiValue, ObjectLike, Result, StdLib, Table, ThreadStatus, UserData,
+    Error, Function, Lua, LuaOptions, MultiValue, ObjectLike, Result, StdLib, Table, UserData,
     UserDataMethods, UserDataRef, Value,
 };
 
@@ -40,7 +39,7 @@ async fn test_async_function() -> Result<()> {
 async fn test_async_function_wrap() -> Result<()> {
     let lua = Lua::new();
 
-    let f = Function::wrap_async(|s: StdString| async move {
+    let f = Function::wrap_async(|s: String| async move {
         tokio::task::yield_now().await;
         Ok(s)
     });
@@ -68,7 +67,7 @@ async fn test_async_function_wrap() -> Result<()> {
 async fn test_async_function_wrap_raw() -> Result<()> {
     let lua = Lua::new();
 
-    let f = Function::wrap_raw_async(|s: StdString| async move {
+    let f = Function::wrap_raw_async(|s: String| async move {
         tokio::task::yield_now().await;
         s
     });
@@ -249,7 +248,7 @@ async fn test_async_return_async_closure() -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "lua54")]
+#[cfg(any(feature = "lua55", feature = "lua54"))]
 #[tokio::test]
 async fn test_async_lua54_to_be_closed() -> Result<()> {
     let lua = Lua::new();
@@ -423,9 +422,9 @@ async fn test_async_thread_pool() -> Result<()> {
 
 #[tokio::test]
 async fn test_async_userdata() -> Result<()> {
-    struct MyUserData(u64);
+    struct MyUserdata(u64);
 
-    impl UserData for MyUserData {
+    impl UserData for MyUserdata {
         fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
             methods.add_async_method("get_value", |_, data, ()| async move {
                 sleep_ms(10).await;
@@ -436,6 +435,11 @@ async fn test_async_userdata() -> Result<()> {
                 sleep_ms(10).await;
                 data.0 = n;
                 Ok(())
+            });
+
+            methods.add_async_method_once("take_value", |_, data, ()| async move {
+                sleep_ms(10).await;
+                Ok(data.0)
             });
 
             methods.add_async_function("sleep", |_, n| async move {
@@ -479,7 +483,7 @@ async fn test_async_userdata() -> Result<()> {
     let lua = Lua::new();
     let globals = lua.globals();
 
-    let userdata = lua.create_userdata(MyUserData(11))?;
+    let userdata = lua.create_userdata(MyUserdata(11))?;
     globals.set("userdata", &userdata)?;
 
     lua.load(
@@ -517,6 +521,21 @@ async fn test_async_userdata() -> Result<()> {
 
     #[cfg(not(any(feature = "lua51", feature = "luau")))]
     assert_eq!(userdata.call_async::<String>(()).await?, "elapsed:24ms");
+
+    // Take value
+    let userdata2 = lua.create_userdata(MyUserdata(0))?;
+    globals.set("userdata2", userdata2)?;
+    lua.load("assert(userdata:take_value() == 24)")
+        .exec_async()
+        .await?;
+    match lua.load("userdata2.take_value(userdata)").exec_async().await {
+        Err(Error::CallbackError { cause, .. }) => {
+            let err = cause.to_string();
+            assert!(err.contains("bad argument `self` to `MyUserdata.take_value`"));
+            assert!(err.contains("userdata has been destructed"));
+        }
+        r => panic!("expected Err(CallbackError), got {r:?}"),
+    }
 
     Ok(())
 }
@@ -650,7 +669,7 @@ async fn test_async_hook() -> Result<()> {
     static HOOK_CALLED: AtomicBool = AtomicBool::new(false);
     lua.set_global_hook(mlua::HookTriggers::new().every_line(), move |_, _| {
         if !HOOK_CALLED.swap(true, Ordering::Relaxed) {
-            #[cfg(any(feature = "lu53", feature = "lua54"))]
+            #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53"))]
             return Ok(mlua::VmState::Yield);
         }
         Ok(mlua::VmState::Continue)
@@ -695,7 +714,7 @@ fn test_async_yield_with() -> Result<()> {
     assert_eq!(thread.resume::<(i32, i32)>((10, 11))?, (21, 110));
     assert_eq!(thread.resume::<(i32, i32)>((11, 12))?, (23, 132));
     assert_eq!(thread.resume::<(i32, i32)>((12, 13))?, (0, 0));
-    assert_eq!(thread.status(), ThreadStatus::Finished);
+    assert!(thread.is_finished());
 
     Ok(())
 }

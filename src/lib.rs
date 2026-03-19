@@ -61,12 +61,12 @@
 //! [`Future`]: std::future::Future
 //! [`serde::Serialize`]: https://docs.serde.rs/serde/ser/trait.Serialize.html
 //! [`serde::Deserialize`]: https://docs.serde.rs/serde/de/trait.Deserialize.html
+//! [`AsyncThread`]: crate::thread::AsyncThread
 
 // Deny warnings inside doc tests / examples. When this isn't present, rustdoc doesn't show *any*
 // warnings at all.
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(not(send), allow(clippy::arc_with_non_send_sync))]
-#![allow(clippy::ptr_eq)]
 #![allow(unsafe_op_in_unsafe_fn)]
 
 #[macro_use]
@@ -75,55 +75,73 @@ mod macros;
 mod buffer;
 mod chunk;
 mod conversion;
-mod debug;
 mod error;
-mod function;
-#[cfg(any(feature = "luau", doc))]
-mod luau;
 mod memory;
 mod multi;
 mod scope;
-mod state;
 mod stdlib;
-mod string;
-mod table;
-mod thread;
 mod traits;
 mod types;
-mod userdata;
 mod util;
 mod value;
 mod vector;
 
+pub mod debug;
+pub mod function;
+#[cfg(any(feature = "luau", doc))]
+#[cfg_attr(docsrs, doc(cfg(feature = "luau")))]
+pub mod luau;
 pub mod prelude;
+pub mod state;
+pub mod string;
+pub mod table;
+pub mod thread;
+pub mod userdata;
 
 pub use bstr::BString;
 pub use ffi::{self, lua_CFunction, lua_State};
 
 pub use crate::chunk::{AsChunk, Chunk, ChunkMode};
-pub use crate::debug::{Debug, DebugEvent, DebugNames, DebugSource, DebugStack};
 pub use crate::error::{Error, ErrorContext, ExternalError, ExternalResult, Result};
-pub use crate::function::{Function, FunctionInfo};
+#[doc(inline)]
+pub use crate::function::Function;
 pub use crate::multi::{MultiValue, Variadic};
 pub use crate::scope::Scope;
-pub use crate::state::{GCMode, Lua, LuaOptions, WeakLua};
+#[doc(inline)]
+pub use crate::state::{Lua, LuaOptions, WeakLua};
 pub use crate::stdlib::StdLib;
-pub use crate::string::{BorrowedBytes, BorrowedStr, String};
-pub use crate::table::{Table, TablePairs, TableSequence};
-pub use crate::thread::{Thread, ThreadStatus};
+#[doc(inline)]
+pub use crate::string::{BorrowedBytes, BorrowedStr, LuaString};
+#[doc(inline)]
+pub use crate::table::Table;
+#[doc(inline)]
+pub use crate::thread::Thread;
 pub use crate::traits::{
     FromLua, FromLuaMulti, IntoLua, IntoLuaMulti, LuaNativeFn, LuaNativeFnMut, ObjectLike,
 };
 pub use crate::types::{
-    AppDataRef, AppDataRefMut, Either, Integer, LightUserData, MaybeSend, Number, RegistryKey, VmState,
+    AppDataRef, AppDataRefMut, Either, Integer, LightUserData, MaybeSend, MaybeSync, Number, RegistryKey,
+    VmState,
 };
-pub use crate::userdata::{
-    AnyUserData, MetaMethod, UserData, UserDataFields, UserDataMetatable, UserDataMethods, UserDataRef,
-    UserDataRefMut, UserDataRegistry,
-};
+#[doc(inline)]
+pub use crate::userdata::AnyUserData;
 pub use crate::value::{Nil, Value};
 
+// Re-export some types to keep backward compatibility and avoid breaking changes in the public API.
+#[doc(hidden)]
+pub use crate::string::LuaString as String;
+#[doc(hidden)]
+pub use crate::table::{TablePairs, TableSequence};
+#[doc(hidden)]
+pub use crate::thread::ThreadStatus;
+#[doc(hidden)]
+pub use crate::userdata::{
+    MetaMethod, UserData, UserDataFields, UserDataMetatable, UserDataMethods, UserDataRef, UserDataRefMut,
+    UserDataRegistry,
+};
+
 #[cfg(not(feature = "luau"))]
+#[doc(inline)]
 pub use crate::debug::HookTriggers;
 
 #[cfg(any(feature = "luau", doc))]
@@ -131,19 +149,17 @@ pub use crate::debug::HookTriggers;
 pub use crate::{
     buffer::Buffer,
     chunk::{CompileConstant, Compiler},
-    function::CoverageInfo,
-    luau::{NavigateError, Require, TextRequirer},
     vector::Vector,
 };
 
 #[cfg(feature = "async")]
 #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
-pub use crate::{thread::AsyncThread, traits::LuaNativeAsyncFn};
+pub use crate::traits::LuaNativeAsyncFn;
 
 #[cfg(feature = "serde")]
 #[doc(inline)]
 pub use crate::{
-    serde::{de::Options as DeserializeOptions, ser::Options as SerializeOptions, LuaSerdeExt},
+    serde::{LuaSerdeExt, de::Options as DeserializeOptions, ser::Options as SerializeOptions},
     value::SerializableValue,
 };
 

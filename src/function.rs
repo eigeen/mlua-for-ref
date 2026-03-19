@@ -1,3 +1,84 @@
+//! Lua function handling.
+//!
+//! This module provides types for working with Lua functions from Rust, including
+//! both Lua-defined functions and native Rust callbacks.
+//!
+//! # Main Types
+//!
+//! - [`Function`] - A handle to a Lua function that can be called from Rust.
+//! - [`FunctionInfo`] - Debug information about a function (name, source, line numbers, etc.).
+//! - [`CoverageInfo`] - Code coverage data for Luau functions (requires `luau` feature).
+//!
+//! # Calling Functions
+//!
+//! Use [`Function::call`] to invoke a Lua function synchronously:
+//!
+//! ```
+//! # use mlua::{Function, Lua, Result};
+//! # fn main() -> Result<()> {
+//! let lua = Lua::new();
+//!
+//! // Get a built-in function
+//! let print: Function = lua.globals().get("print")?;
+//! print.call::<()>("Hello from Rust!")?;
+//!
+//! // Call a function that returns values
+//! let tonumber: Function = lua.globals().get("tonumber")?;
+//! let n: i32 = tonumber.call("42")?;
+//! assert_eq!(n, 42);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! For asynchronous execution, use `Function::call_async` (requires `async` feature):
+//!
+//! ```ignore
+//! let result: String = my_async_func.call_async(args).await?;
+//! ```
+//!
+//! # Creating Functions
+//!
+//! Functions can be created from Rust closures using [`Lua::create_function`]:
+//!
+//! ```
+//! # use mlua::{Lua, Result};
+//! # fn main() -> Result<()> {
+//! let lua = Lua::new();
+//!
+//! let greet = lua.create_function(|_, name: String| {
+//!     Ok(format!("Hello, {}!", name))
+//! })?;
+//!
+//! lua.globals().set("greet", greet)?;
+//! let result: String = lua.load(r#"greet("World")"#).eval()?;
+//! assert_eq!(result, "Hello, World!");
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! For simpler cases, use [`Function::wrap`] or [`Function::wrap_raw`] to convert a Rust function
+//! directly:
+//!
+//! ```
+//! # use mlua::{Function, Lua, Result};
+//! # fn main() -> Result<()> {
+//! let lua = Lua::new();
+//!
+//! fn add(a: i32, b: i32) -> i32 { a + b }
+//!
+//! lua.globals().set("add", Function::wrap_raw(add))?;
+//! let sum: i32 = lua.load("add(2, 3)").eval()?;
+//! assert_eq!(sum, 5);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Function Environments
+//!
+//! Lua functions have an associated environment table that determines how global
+//! variables are resolved. Use [`Function::environment`] and [`Function::set_environment`]
+//! to inspect or modify this environment.
+
 use std::cell::RefCell;
 use std::os::raw::{c_int, c_void};
 use std::{mem, ptr, slice};
@@ -8,7 +89,7 @@ use crate::table::Table;
 use crate::traits::{FromLuaMulti, IntoLua, IntoLuaMulti, LuaNativeFn, LuaNativeFnMut};
 use crate::types::{Callback, LuaType, MaybeSend, ValueRef};
 use crate::util::{
-    assert_stack, check_stack, linenumber_to_usize, pop_error, ptr_to_lossy_str, ptr_to_str, StackGuard,
+    StackGuard, assert_stack, check_stack, linenumber_to_usize, pop_error, ptr_to_lossy_str, ptr_to_str,
 };
 use crate::value::Value;
 
@@ -18,7 +99,7 @@ use {
     crate::traits::LuaNativeAsyncFn,
     crate::types::AsyncCallback,
     std::future::{self, Future},
-    std::pin::Pin,
+    std::pin::{Pin, pin},
     std::task::{Context, Poll},
 };
 
@@ -32,6 +113,7 @@ pub struct Function(pub(crate) ValueRef);
 ///
 /// [`Lua Debug Interface`]: https://www.lua.org/manual/5.4/manual.html#4.7
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct FunctionInfo {
     /// A (reasonable) name of the function (`None` if the name cannot be found).
     pub name: Option<String>,
@@ -50,6 +132,16 @@ pub struct FunctionInfo {
     pub line_defined: Option<usize>,
     /// The line number where the definition of the function ends (not set by Luau).
     pub last_line_defined: Option<usize>,
+    /// The number of upvalues of the function.
+    pub num_upvalues: u8,
+    /// The number of parameters of the function (always 0 for C).
+    #[cfg(any(not(any(feature = "lua51", feature = "luajit")), doc))]
+    #[cfg_attr(docsrs, doc(cfg(not(any(feature = "lua51", feature = "luajit")))))]
+    pub num_params: u8,
+    /// Whether the function is a variadic function (always true for C).
+    #[cfg(any(not(any(feature = "lua51", feature = "luajit")), doc))]
+    #[cfg_attr(docsrs, doc(cfg(not(any(feature = "lua51", feature = "luajit")))))]
+    pub is_vararg: bool,
 }
 
 /// Luau function coverage snapshot.
@@ -154,7 +246,7 @@ impl Function {
     /// # }
     /// ```
     ///
-    /// [`AsyncThread`]: crate::AsyncThread
+    /// [`AsyncThread`]: crate::thread::AsyncThread
     #[cfg(feature = "async")]
     #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
     pub fn call_async<R>(&self, args: impl IntoLuaMulti) -> AsyncCallFuture<R>
@@ -276,7 +368,7 @@ impl Function {
 
             #[cfg(any(feature = "lua51", feature = "luajit", feature = "luau"))]
             ffi::lua_getfenv(state, -1);
-            #[cfg(any(feature = "lua54", feature = "lua53", feature = "lua52"))]
+            #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53", feature = "lua52"))]
             for i in 1..=255 {
                 // Traverse upvalues until we find the _ENV one
                 match ffi::lua_getupvalue(state, -1, i) {
@@ -316,7 +408,7 @@ impl Function {
                 lua.push_ref(&env.0);
                 ffi::lua_setfenv(state, -2);
             }
-            #[cfg(any(feature = "lua54", feature = "lua53", feature = "lua52"))]
+            #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53", feature = "lua52"))]
             for i in 1..=255 {
                 match ffi::lua_getupvalue(state, -1, i) {
                     s if s.is_null() => return Ok(false),
@@ -343,7 +435,8 @@ impl Function {
 
     /// Returns information about the function.
     ///
-    /// Corresponds to the `>Sn` what mask for [`lua_getinfo`] when applied to the function.
+    /// Corresponds to the `>Snu` (`>Sn` for Luau) what mask for
+    /// [`lua_getinfo`] when applied to the function.
     ///
     /// [`lua_getinfo`]: https://www.lua.org/manual/5.4/manual.html#lua_getinfo
     pub fn info(&self) -> FunctionInfo {
@@ -355,11 +448,16 @@ impl Function {
 
             let mut ar: ffi::lua_Debug = mem::zeroed();
             lua.push_ref(&self.0);
+
             #[cfg(not(feature = "luau"))]
-            let res = ffi::lua_getinfo(state, cstr!(">Sn"), &mut ar);
+            let res = ffi::lua_getinfo(state, cstr!(">Snu"), &mut ar);
+            #[cfg(not(feature = "luau"))]
+            mlua_assert!(res != 0, "lua_getinfo failed with `>Snu`");
+
             #[cfg(feature = "luau")]
-            let res = ffi::lua_getinfo(state, -1, cstr!("sn"), &mut ar);
-            mlua_assert!(res != 0, "lua_getinfo failed with `>Sn`");
+            let res = ffi::lua_getinfo(state, -1, cstr!("snau"), &mut ar);
+            #[cfg(feature = "luau")]
+            mlua_assert!(res != 0, "lua_getinfo failed with `snau`");
 
             FunctionInfo {
                 name: ptr_to_lossy_str(ar.name).map(|s| s.into_owned()),
@@ -381,6 +479,14 @@ impl Function {
                 last_line_defined: linenumber_to_usize(ar.lastlinedefined),
                 #[cfg(feature = "luau")]
                 last_line_defined: None,
+                #[cfg(not(feature = "luau"))]
+                num_upvalues: ar.nups as _,
+                #[cfg(feature = "luau")]
+                num_upvalues: ar.nupvals,
+                #[cfg(not(any(feature = "lua51", feature = "luajit")))]
+                num_params: ar.nparams,
+                #[cfg(not(any(feature = "lua51", feature = "luajit")))]
+                is_vararg: ar.isvararg != 0,
             }
         }
     }
@@ -400,11 +506,14 @@ impl Function {
             _state: *mut ffi::lua_State,
             buf: *const c_void,
             buf_len: usize,
-            data: *mut c_void,
+            data_ptr: *mut c_void,
         ) -> c_int {
-            let data = &mut *(data as *mut Vec<u8>);
-            let buf = slice::from_raw_parts(buf as *const u8, buf_len);
-            data.extend_from_slice(buf);
+            // If `data` is null, then it's a signal that write is finished.
+            if !data_ptr.is_null() && buf_len > 0 {
+                let data = &mut *(data_ptr as *mut Vec<u8>);
+                let buf = slice::from_raw_parts(buf as *const u8, buf_len);
+                data.extend_from_slice(buf);
+            }
             0
         }
 
@@ -653,7 +762,9 @@ impl LuaType for Function {
     const TYPE_ID: c_int = ffi::LUA_TFUNCTION;
 }
 
+/// Future for asynchronous function calls.
 #[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct AsyncCallFuture<R: FromLuaMulti>(Result<AsyncThread<R>>);
 
@@ -669,13 +780,9 @@ impl<R: FromLuaMulti> Future for AsyncCallFuture<R> {
     type Output = Result<R>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // Safety: We're not moving any pinned data
-        let this = unsafe { self.get_unchecked_mut() };
+        let this = self.get_mut();
         match &mut this.0 {
-            Ok(thread) => {
-                let pinned_thread = unsafe { Pin::new_unchecked(thread) };
-                pinned_thread.poll(cx)
-            }
+            Ok(thread) => pin!(thread).poll(cx),
             Err(err) => Poll::Ready(Err(err.clone())),
         }
     }

@@ -1,15 +1,32 @@
-use std::ffi::CStr;
+//! Luau-specific extensions and types.
+//!
+//! This module provides Luau-specific functionality including custom `require` implementations,
+//! heap memory analysis, and Luau VM integration utilities.
+//!
+//! # Overview
+//!
+//! - [`Require`] — trait for implementing custom module loaders used with
+//!   [`Lua::create_require_function`]
+//! - [`FsRequirer`] — default filesystem-based [`Require`] implementation
+//! - [`NavigateError`] — error type returned when navigating the module path
+//! - [`HeapDump`] — snapshot of Luau heap memory usage, obtained via [`Lua::heap_dump`]
+//!
+//! [`Lua::create_require_function`]: crate::Lua::create_require_function
+//! [`Lua::heap_dump`]: crate::Lua::heap_dump
+
+use std::ffi::{CStr, CString};
 use std::os::raw::c_int;
 use std::ptr;
 
 use crate::chunk::ChunkMode;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::function::Function;
-use crate::state::{callback_error_ext, ExtraData, Lua};
+use crate::state::{ExtraData, Lua, callback_error_ext};
 use crate::traits::{FromLuaMulti, IntoLua};
 use crate::types::MaybeSend;
 
-pub use require::{NavigateError, Require, TextRequirer};
+pub use heap_dump::HeapDump;
+pub use require::{FsRequirer, NavigateError, Require};
 
 // Since Luau has some missing standard functions, we re-implement them here
 
@@ -20,6 +37,56 @@ impl Lua {
     #[cfg_attr(docsrs, doc(cfg(feature = "luau")))]
     pub fn create_require_function<R: Require + MaybeSend + 'static>(&self, require: R) -> Result<Function> {
         require::create_require_function(self, require)
+    }
+
+    /// Set the memory category for subsequent allocations from this Lua state.
+    ///
+    /// The category "main" is reserved for the default memory category.
+    /// Maximum of 255 categories can be registered.
+    /// The category is set per Lua thread (state) and affects all allocations made from that
+    /// thread.
+    ///
+    /// Return error if too many categories are registered or if the category name is invalid.
+    ///
+    /// See [`Lua::heap_dump`] for tracking memory usage by category.
+    #[cfg(any(feature = "luau", doc))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "luau")))]
+    pub fn set_memory_category(&self, category: &str) -> Result<()> {
+        let lua = self.lock();
+
+        if category.contains(|c| !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_')) {
+            return Err(Error::runtime("invalid memory category name"));
+        }
+        let cat_id = unsafe {
+            let extra = ExtraData::get(lua.state());
+            match ((*extra).mem_categories.iter().enumerate())
+                .find(|&(_, name)| name.as_bytes() == category.as_bytes())
+            {
+                Some((id, _)) => id as u8,
+                None => {
+                    let new_id = (*extra).mem_categories.len() as u8;
+                    if new_id == 255 {
+                        return Err(Error::runtime("too many memory categories registered"));
+                    }
+                    (*extra).mem_categories.push(CString::new(category).unwrap());
+                    new_id
+                }
+            }
+        };
+        unsafe { ffi::lua_setmemcat(lua.state(), cat_id as i32) };
+
+        Ok(())
+    }
+
+    /// Dumps the current Lua VM heap state.
+    ///
+    /// The returned `HeapDump` can be used to analyze memory usage.
+    /// It's recommended to call [`Lua::gc_collect`] before dumping the heap.
+    #[cfg(any(feature = "luau", doc))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "luau")))]
+    pub fn heap_dump(&self) -> Result<HeapDump> {
+        let lua = self.lock();
+        unsafe { heap_dump::HeapDump::new(lua.state()).ok_or_else(|| Error::runtime("unable to dump heap")) }
     }
 
     pub(crate) unsafe fn configure_luau(&self) -> Result<()> {
@@ -35,7 +102,7 @@ impl Lua {
         }
 
         // Enable default `require` implementation
-        let require = self.create_require_function(require::TextRequirer::new())?;
+        let require = self.create_require_function(FsRequirer::new())?;
         self.globals().raw_set("require", require)?;
 
         Ok(())
@@ -96,4 +163,6 @@ unsafe extern "C-unwind" fn lua_loadstring(state: *mut ffi::lua_State) -> c_int 
     })
 }
 
+mod heap_dump;
+mod json;
 mod require;

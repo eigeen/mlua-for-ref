@@ -37,6 +37,16 @@ pub const LUA_ERRRUN: c_int = 2;
 pub const LUA_ERRSYNTAX: c_int = 3;
 pub const LUA_ERRMEM: c_int = 4;
 pub const LUA_ERRERR: c_int = 5;
+pub const LUA_BREAK: c_int = 6; // yielded for a debug breakpoint
+
+//
+// Coroutine status
+//
+pub const LUA_CORUN: c_int = 0; // running
+pub const LUA_COSUS: c_int = 1; // suspended
+pub const LUA_CONOR: c_int = 2; // 'normal' (it resumed another coroutine)
+pub const LUA_COFIN: c_int = 3; // finished
+pub const LUA_COERR: c_int = 4; // finished with error
 
 /// A raw Lua state associated with a thread.
 #[repr(C)]
@@ -145,8 +155,15 @@ unsafe extern "C-unwind" {
     pub fn lua_toboolean(L: *mut lua_State, idx: c_int) -> c_int;
     pub fn lua_tolstring(L: *mut lua_State, idx: c_int, len: *mut usize) -> *const c_char;
     pub fn lua_tostringatom(L: *mut lua_State, idx: c_int, atom: *mut c_int) -> *const c_char;
+    pub fn lua_tolstringatom(
+        L: *mut lua_State,
+        idx: c_int,
+        len: *mut usize,
+        atom: *mut c_int,
+    ) -> *const c_char;
     pub fn lua_namecallatom(L: *mut lua_State, atom: *mut c_int) -> *const c_char;
-    pub fn lua_objlen(L: *mut lua_State, idx: c_int) -> usize;
+    #[link_name = "lua_objlen"]
+    pub fn lua_objlen_(L: *mut lua_State, idx: c_int) -> c_int;
     pub fn lua_tocfunction(L: *mut lua_State, idx: c_int) -> Option<lua_CFunction>;
     pub fn lua_tolightuserdata(L: *mut lua_State, idx: c_int) -> *mut c_void;
     pub fn lua_tolightuserdatatagged(L: *mut lua_State, idx: c_int, tag: c_int) -> *mut c_void;
@@ -203,6 +220,7 @@ unsafe extern "C-unwind" {
     pub fn lua_rawget(L: *mut lua_State, idx: c_int) -> c_int;
     #[link_name = "lua_rawgeti"]
     pub fn lua_rawgeti_(L: *mut lua_State, idx: c_int, n: c_int) -> c_int;
+    pub fn lua_rawgetptagged(L: *mut lua_State, idx: c_int, p: *const c_void, tag: c_int) -> c_int;
     pub fn lua_createtable(L: *mut lua_State, narr: c_int, nrec: c_int);
 
     pub fn lua_setreadonly(L: *mut lua_State, idx: c_int, enabled: c_int);
@@ -217,9 +235,11 @@ unsafe extern "C-unwind" {
     //
     pub fn lua_settable(L: *mut lua_State, idx: c_int);
     pub fn lua_setfield(L: *mut lua_State, idx: c_int, k: *const c_char);
+    pub fn lua_rawsetfield(L: *mut lua_State, idx: c_int, k: *const c_char);
     pub fn lua_rawset(L: *mut lua_State, idx: c_int);
     #[link_name = "lua_rawseti"]
     pub fn lua_rawseti_(L: *mut lua_State, idx: c_int, n: c_int);
+    pub fn lua_rawsetptagged(L: *mut lua_State, idx: c_int, p: *const c_void, tag: c_int);
     pub fn lua_setmetatable(L: *mut lua_State, objindex: c_int) -> c_int;
     pub fn lua_setfenv(L: *mut lua_State, idx: c_int) -> c_int;
 
@@ -249,6 +269,12 @@ unsafe extern "C-unwind" {
     pub fn lua_isyieldable(L: *mut lua_State) -> c_int;
     pub fn lua_getthreaddata(L: *mut lua_State) -> *mut c_void;
     pub fn lua_setthreaddata(L: *mut lua_State, data: *mut c_void);
+    pub fn lua_costatus(L: *mut lua_State, co: *mut lua_State) -> c_int;
+}
+
+#[inline(always)]
+pub unsafe fn lua_objlen(L: *mut lua_State, idx: c_int) -> usize {
+    lua_objlen_(L, idx) as usize
 }
 
 //
@@ -285,7 +311,7 @@ unsafe extern "C-unwind" {
     pub fn lua_next(L: *mut lua_State, idx: c_int) -> c_int;
     pub fn lua_rawiter(L: *mut lua_State, idx: c_int, iter: c_int) -> c_int;
     pub fn lua_concat(L: *mut lua_State, n: c_int);
-    // TODO: lua_encodepointer
+    pub fn lua_encodepointer(L: *mut lua_State, p: usize) -> usize;
     pub fn lua_clock() -> c_double;
     pub fn lua_setuserdatatag(L: *mut lua_State, idx: c_int, tag: c_int);
     pub fn lua_setuserdatadtor(L: *mut lua_State, tag: c_int, dtor: Option<lua_Destructor>);
@@ -296,6 +322,7 @@ unsafe extern "C-unwind" {
     pub fn lua_getlightuserdataname(L: *mut lua_State, tag: c_int) -> *const c_char;
     pub fn lua_clonefunction(L: *mut lua_State, idx: c_int);
     pub fn lua_cleartable(L: *mut lua_State, idx: c_int);
+    pub fn lua_clonetable(L: *mut lua_State, idx: c_int);
     pub fn lua_getallocf(L: *mut lua_State, ud: *mut *mut c_void) -> lua_Alloc;
 }
 
@@ -355,7 +382,10 @@ pub unsafe fn lua_newuserdata_t<T>(L: *mut lua_State, data: T) -> *mut T {
     ud_ptr
 }
 
-// TODO: lua_strlen
+#[inline(always)]
+pub unsafe fn lua_strlen(L: *mut lua_State, i: c_int) -> usize {
+    lua_objlen(L, i)
+}
 
 #[inline(always)]
 pub unsafe fn lua_isfunction(L: *mut lua_State, n: c_int) -> c_int {
@@ -471,6 +501,12 @@ pub type lua_Coverage = unsafe extern "C-unwind" fn(
     size: usize,
 );
 
+pub type lua_CounterFunction =
+    unsafe extern "C-unwind" fn(context: *mut c_void, function: *const c_char, linedefined: c_int);
+
+pub type lua_CounterValue =
+    unsafe extern "C-unwind" fn(context: *mut c_void, kind: c_int, line: c_int, hits: u64);
+
 unsafe extern "C-unwind" {
     pub fn lua_stackdepth(L: *mut lua_State) -> c_int;
     pub fn lua_getinfo(L: *mut lua_State, level: c_int, what: *const c_char, ar: *mut lua_Debug) -> c_int;
@@ -484,6 +520,14 @@ unsafe extern "C-unwind" {
     pub fn lua_breakpoint(L: *mut lua_State, funcindex: c_int, line: c_int, enabled: c_int) -> c_int;
 
     pub fn lua_getcoverage(L: *mut lua_State, funcindex: c_int, context: *mut c_void, callback: lua_Coverage);
+
+    pub fn lua_getcounters(
+        L: *mut lua_State,
+        funcindex: c_int,
+        context: *mut c_void,
+        functionvisit: lua_CounterFunction,
+        countervisit: lua_CounterValue,
+    );
 
     pub fn lua_debugtrace(L: *mut lua_State) -> *const c_char;
 }
@@ -522,7 +566,7 @@ pub struct lua_Callbacks {
     /// gets called when L is created (LP == parent) or destroyed (LP == NULL)
     pub userthread: Option<unsafe extern "C-unwind" fn(LP: *mut lua_State, L: *mut lua_State)>,
     /// gets called when a string is created; returned atom can be retrieved via tostringatom
-    pub useratom: Option<unsafe extern "C-unwind" fn(s: *const c_char, l: usize) -> i16>,
+    pub useratom: Option<unsafe extern "C-unwind" fn(L: *mut lua_State, s: *const c_char, l: usize) -> i16>,
 
     /// gets called when BREAK instruction is encountered
     pub debugbreak: Option<unsafe extern "C-unwind" fn(L: *mut lua_State, ar: *mut lua_Debug)>,
@@ -545,4 +589,9 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn luau_setfflag(name: *const c_char, value: c_int) -> c_int;
     pub fn lua_getmetatablepointer(L: *mut lua_State, idx: c_int) -> *const c_void;
+    pub fn lua_gcdump(
+        L: *mut lua_State,
+        file: *mut c_void,
+        category_name: Option<unsafe extern "C" fn(L: *mut lua_State, memcat: u8) -> *const c_char>,
+    );
 }

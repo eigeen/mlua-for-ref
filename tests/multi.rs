@@ -1,4 +1,6 @@
-use mlua::{Error, ExternalError, Integer, IntoLuaMulti, Lua, MultiValue, Result, String, Value, Variadic};
+use mlua::{
+    Error, ExternalError, Integer, IntoLuaMulti, Lua, LuaString, MultiValue, Result, Value, Variadic,
+};
 
 #[test]
 fn test_result_conversions() -> Result<()> {
@@ -70,6 +72,26 @@ fn test_multivalue() {
     let vec = multi.into_vec();
     assert_eq!(&vec, &[Value::Integer(3), Value::Integer(1), Value::Integer(2)]);
     let _multi2 = MultiValue::from_vec(vec);
+}
+
+#[test]
+fn test_multivalue_by_ref() -> Result<()> {
+    let lua = Lua::new();
+    let multi = MultiValue::from_vec(vec![
+        Value::Integer(3),
+        Value::String(lua.create_string("hello")?),
+        Value::Boolean(true),
+    ]);
+
+    let f = lua.create_function(|_, (i, s, b): (i32, LuaString, bool)| {
+        assert_eq!(i, 3);
+        assert_eq!(s.to_str()?, "hello");
+        assert_eq!(b, true);
+        Ok(())
+    })?;
+    f.call::<()>(&multi)?;
+
+    Ok(())
 }
 
 #[test]

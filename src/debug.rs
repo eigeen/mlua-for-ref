@@ -1,3 +1,9 @@
+//! Lua debugging interface.
+//!
+//! This module provides access to the Lua debug interface, allowing inspection of the call stack,
+//! and function information. The main types are [`struct@Debug`] for accessing debug information
+//! and [`HookTriggers`] for configuring debug hooks.
+
 use std::borrow::Cow;
 use std::os::raw::c_int;
 
@@ -5,7 +11,7 @@ use ffi::{lua_Debug, lua_State};
 
 use crate::function::Function;
 use crate::state::RawLua;
-use crate::util::{assert_stack, linenumber_to_usize, ptr_to_lossy_str, ptr_to_str, StackGuard};
+use crate::util::{StackGuard, assert_stack, linenumber_to_usize, ptr_to_lossy_str, ptr_to_str};
 
 /// Contains information about currently executing Lua code.
 ///
@@ -133,12 +139,6 @@ impl<'a> Debug<'a> {
         }
     }
 
-    #[doc(hidden)]
-    #[deprecated(note = "Use `current_line` instead")]
-    pub fn curr_line(&self) -> i32 {
-        self.current_line().map(|n| n as i32).unwrap_or(-1)
-    }
-
     /// Corresponds to the `l` "what" mask. Returns the current line.
     pub fn current_line(&self) -> Option<usize> {
         unsafe {
@@ -159,10 +159,10 @@ impl<'a> Debug<'a> {
 
     /// Corresponds to the `t` "what" mask. Returns true if the hook is in a function tail call,
     /// false otherwise.
-    #[cfg(any(feature = "lua54", feature = "lua53", feature = "lua52"))]
+    #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53", feature = "lua52"))]
     #[cfg_attr(
         docsrs,
-        doc(cfg(any(feature = "lua54", feature = "lua53", feature = "lua52")))
+        doc(cfg(any(feature = "lua55", feature = "lua54", feature = "lua53", feature = "lua52")))
     )]
     pub fn is_tail_call(&self) -> bool {
         unsafe {
@@ -190,15 +190,15 @@ impl<'a> Debug<'a> {
 
             #[cfg(not(feature = "luau"))]
             let stack = DebugStack {
-                num_ups: (*self.ar).nups as _,
-                #[cfg(any(feature = "lua54", feature = "lua53", feature = "lua52"))]
+                num_upvalues: (*self.ar).nups as _,
+                #[cfg(not(any(feature = "lua51", feature = "luajit")))]
                 num_params: (*self.ar).nparams as _,
-                #[cfg(any(feature = "lua54", feature = "lua53", feature = "lua52"))]
+                #[cfg(not(any(feature = "lua51", feature = "luajit")))]
                 is_vararg: (*self.ar).isvararg != 0,
             };
             #[cfg(feature = "luau")]
             let stack = DebugStack {
-                num_ups: (*self.ar).nupvals,
+                num_upvalues: (*self.ar).nupvals,
                 num_params: (*self.ar).nparams,
                 is_vararg: (*self.ar).isvararg != 0,
             };
@@ -208,6 +208,8 @@ impl<'a> Debug<'a> {
 }
 
 /// Represents a specific event that triggered the hook.
+#[cfg(not(feature = "luau"))]
+#[cfg_attr(docsrs, doc(cfg(not(feature = "luau"))))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DebugEvent {
     Call,
@@ -218,6 +220,9 @@ pub enum DebugEvent {
     Unknown(c_int),
 }
 
+/// Contains the name information of a function in the call stack.
+///
+/// Returned by the [`Debug::names`] method.
 #[derive(Clone, Debug)]
 pub struct DebugNames<'a> {
     /// A (reasonable) name of the function (`None` if the name cannot be found).
@@ -228,6 +233,9 @@ pub struct DebugNames<'a> {
     pub name_what: Option<&'static str>,
 }
 
+/// Contains the source information of a function in the call stack.
+///
+/// Returned by the [`Debug::source`] method.
 #[derive(Clone, Debug)]
 pub struct DebugSource<'a> {
     /// Source of the chunk that created the function.
@@ -243,23 +251,20 @@ pub struct DebugSource<'a> {
     pub what: &'static str,
 }
 
+/// Contains stack information about a function in the call stack.
+///
+/// Returned by the [`Debug::stack`] method.
 #[derive(Copy, Clone, Debug)]
 pub struct DebugStack {
-    /// Number of upvalues.
-    pub num_ups: u8,
-    /// Number of parameters.
-    #[cfg(any(feature = "lua54", feature = "lua53", feature = "lua52", feature = "luau"))]
-    #[cfg_attr(
-        docsrs,
-        doc(cfg(any(feature = "lua54", feature = "lua53", feature = "lua52", feature = "luau")))
-    )]
+    /// The number of upvalues of the function.
+    pub num_upvalues: u8,
+    /// The number of parameters of the function (always 0 for C).
+    #[cfg(any(not(any(feature = "lua51", feature = "luajit")), doc))]
+    #[cfg_attr(docsrs, doc(cfg(not(any(feature = "lua51", feature = "luajit")))))]
     pub num_params: u8,
-    /// Whether the function is a vararg function.
-    #[cfg(any(feature = "lua54", feature = "lua53", feature = "lua52", feature = "luau"))]
-    #[cfg_attr(
-        docsrs,
-        doc(cfg(any(feature = "lua54", feature = "lua53", feature = "lua52", feature = "luau")))
-    )]
+    /// Whether the function is a variadic function (always true for C).
+    #[cfg(any(not(any(feature = "lua51", feature = "luajit")), doc))]
+    #[cfg_attr(docsrs, doc(cfg(not(any(feature = "lua51", feature = "luajit")))))]
     pub is_vararg: bool,
 }
 
@@ -337,6 +342,7 @@ impl HookTriggers {
     }
 
     // Compute the mask to pass to `lua_sethook`.
+    #[cfg(not(feature = "luau"))]
     pub(crate) const fn mask(&self) -> c_int {
         let mut mask: c_int = 0;
         if self.on_calls {
@@ -356,6 +362,7 @@ impl HookTriggers {
 
     // Returns the `count` parameter to pass to `lua_sethook`, if applicable. Otherwise, zero is
     // returned.
+    #[cfg(not(feature = "luau"))]
     pub(crate) const fn count(&self) -> c_int {
         match self.every_nth_instruction {
             Some(n) => n as c_int,

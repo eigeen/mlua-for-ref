@@ -1,4 +1,4 @@
-use std::cell::{RefCell, UnsafeCell};
+use std::cell::RefCell;
 
 #[cfg(feature = "serde")]
 use serde::ser::{Serialize, Serializer};
@@ -6,14 +6,14 @@ use serde::ser::{Serialize, Serializer};
 use crate::error::{Error, Result};
 use crate::types::XRc;
 
-use super::lock::{RawLock, UserDataLock};
+use super::lock::{RawLock, RwLock, UserDataLock};
 use super::r#ref::{UserDataRef, UserDataRefMut};
 
 #[cfg(all(feature = "serde", not(feature = "send")))]
 type DynSerialize = dyn erased_serde::Serialize;
 
 #[cfg(all(feature = "serde", feature = "send"))]
-type DynSerialize = dyn erased_serde::Serialize + Send;
+type DynSerialize = dyn erased_serde::Serialize + Send + Sync;
 
 pub(crate) enum UserDataStorage<T> {
     Owned(UserDataVariant<T>),
@@ -23,9 +23,9 @@ pub(crate) enum UserDataStorage<T> {
 // A enum for storing userdata values.
 // It's stored inside a Lua VM and protected by the outer `ReentrantMutex`.
 pub(crate) enum UserDataVariant<T> {
-    Default(XRc<UserDataCell<T>>),
+    Default(XRc<RwLock<T>>),
     #[cfg(feature = "serde")]
-    Serializable(XRc<UserDataCell<Box<DynSerialize>>>, bool), // bool is `is_sync`
+    Serializable(XRc<RwLock<Box<DynSerialize>>>),
 }
 
 impl<T> Clone for UserDataVariant<T> {
@@ -34,7 +34,7 @@ impl<T> Clone for UserDataVariant<T> {
         match self {
             Self::Default(inner) => Self::Default(XRc::clone(inner)),
             #[cfg(feature = "serde")]
-            Self::Serializable(inner, is_sync) => Self::Serializable(XRc::clone(inner), *is_sync),
+            Self::Serializable(inner) => Self::Serializable(XRc::clone(inner)),
         }
     }
 }
@@ -42,10 +42,12 @@ impl<T> Clone for UserDataVariant<T> {
 impl<T> UserDataVariant<T> {
     #[inline(always)]
     pub(super) fn try_borrow_scoped<R>(&self, f: impl FnOnce(&T) -> R) -> Result<R> {
-        // We don't need to check for `T: Sync` because when this method is used (internally),
-        // Lua mutex is already locked.
-        // If non-`Sync` userdata is already borrowed by another thread (via `UserDataRef`), it will be
-        // exclusively locked.
+        // Shared (read) lock is always correct for in-place borrows:
+        // - this method is called internally while the Lua mutex is held, ensuring exclusive Lua-level
+        //   access per call frame
+        // - with `send` feature, all owned userdata satisfies `T: Sync`, so simultaneous shared references
+        //   from multiple threads are sound
+        // - without `send` feature, single-threaded execution makes shared lock safe for any `T`
         let _guard = (self.raw_lock().try_lock_shared_guarded()).map_err(|_| Error::UserDataBorrowError)?;
         Ok(f(unsafe { &*self.as_ptr() }))
     }
@@ -78,10 +80,12 @@ impl<T> UserDataVariant<T> {
             return Err(Error::UserDataBorrowMutError);
         }
         Ok(match self {
-            Self::Default(inner) => XRc::into_inner(inner).unwrap().value.into_inner(),
+            Self::Default(inner) => XRc::into_inner(inner).unwrap().into_inner(),
             #[cfg(feature = "serde")]
-            Self::Serializable(inner, _) => unsafe {
-                let raw = Box::into_raw(XRc::into_inner(inner).unwrap().value.into_inner());
+            Self::Serializable(inner) => unsafe {
+                // The serde variant erases `T` to `Box<DynSerialize>`, so we
+                // must cast the raw pointer back to recover the concrete type.
+                let raw = Box::into_raw(XRc::into_inner(inner).unwrap().into_inner());
                 *Box::from_raw(raw as *mut T)
             },
         })
@@ -92,25 +96,25 @@ impl<T> UserDataVariant<T> {
         match self {
             Self::Default(inner) => XRc::strong_count(inner),
             #[cfg(feature = "serde")]
-            Self::Serializable(inner, _) => XRc::strong_count(inner),
+            Self::Serializable(inner) => XRc::strong_count(inner),
         }
     }
 
     #[inline(always)]
     pub(super) fn raw_lock(&self) -> &RawLock {
         match self {
-            Self::Default(inner) => &inner.raw_lock,
+            Self::Default(inner) => unsafe { inner.raw() },
             #[cfg(feature = "serde")]
-            Self::Serializable(inner, _) => &inner.raw_lock,
+            Self::Serializable(inner) => unsafe { inner.raw() },
         }
     }
 
     #[inline(always)]
     pub(super) fn as_ptr(&self) -> *mut T {
         match self {
-            Self::Default(inner) => inner.value.get(),
+            Self::Default(inner) => inner.data_ptr(),
             #[cfg(feature = "serde")]
-            Self::Serializable(inner, _) => unsafe { &mut **(inner.value.get() as *mut Box<T>) },
+            Self::Serializable(inner) => unsafe { (&mut **inner.data_ptr()) as *mut DynSerialize as *mut T },
         }
     }
 }
@@ -119,47 +123,12 @@ impl<T> UserDataVariant<T> {
 impl Serialize for UserDataStorage<()> {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
         match self {
-            Self::Owned(variant @ UserDataVariant::Serializable(inner, is_sync)) => unsafe {
-                #[cfg(feature = "send")]
-                if *is_sync {
-                    let _guard = (variant.raw_lock().try_lock_shared_guarded())
-                        .map_err(|_| serde::ser::Error::custom(Error::UserDataBorrowError))?;
-                    (*inner.value.get()).serialize(serializer)
-                } else {
-                    let _guard = (variant.raw_lock().try_lock_exclusive_guarded())
-                        .map_err(|_| serde::ser::Error::custom(Error::UserDataBorrowError))?;
-                    (*inner.value.get()).serialize(serializer)
-                }
-                #[cfg(not(feature = "send"))]
-                {
-                    let _ = is_sync;
-                    let _guard = (variant.raw_lock().try_lock_shared_guarded())
-                        .map_err(|_| serde::ser::Error::custom(Error::UserDataBorrowError))?;
-                    (*inner.value.get()).serialize(serializer)
-                }
+            Self::Owned(variant @ UserDataVariant::Serializable(inner)) => unsafe {
+                let _guard = (variant.raw_lock().try_lock_shared_guarded())
+                    .map_err(|_| serde::ser::Error::custom(Error::UserDataBorrowError))?;
+                (*inner.data_ptr()).serialize(serializer)
             },
             _ => Err(serde::ser::Error::custom("cannot serialize <userdata>")),
-        }
-    }
-}
-
-/// A type that provides interior mutability for a userdata value (thread-safe).
-pub(crate) struct UserDataCell<T> {
-    raw_lock: RawLock,
-    value: UnsafeCell<T>,
-}
-
-#[cfg(feature = "send")]
-unsafe impl<T: Send> Send for UserDataCell<T> {}
-#[cfg(feature = "send")]
-unsafe impl<T: Send> Sync for UserDataCell<T> {}
-
-impl<T> UserDataCell<T> {
-    #[inline(always)]
-    fn new(value: T) -> Self {
-        UserDataCell {
-            raw_lock: RawLock::INIT,
-            value: UnsafeCell::new(value),
         }
     }
 }
@@ -173,10 +142,10 @@ pub(crate) enum ScopedUserDataVariant<T> {
 impl<T> Drop for ScopedUserDataVariant<T> {
     #[inline]
     fn drop(&mut self) {
-        if let Self::Boxed(value) = self {
-            if let Ok(value) = value.try_borrow_mut() {
-                unsafe { drop(Box::from_raw(*value)) };
-            }
+        if let Self::Boxed(value) = self
+            && let Ok(value) = value.try_borrow_mut()
+        {
+            unsafe { drop(Box::from_raw(*value)) }
         }
     }
 }
@@ -184,7 +153,7 @@ impl<T> Drop for ScopedUserDataVariant<T> {
 impl<T: 'static> UserDataStorage<T> {
     #[inline(always)]
     pub(crate) fn new(data: T) -> Self {
-        Self::Owned(UserDataVariant::Default(XRc::new(UserDataCell::new(data))))
+        Self::Owned(UserDataVariant::Default(XRc::new(RwLock::new(data))))
     }
 
     #[inline(always)]
@@ -201,11 +170,10 @@ impl<T: 'static> UserDataStorage<T> {
     #[inline(always)]
     pub(crate) fn new_ser(data: T) -> Self
     where
-        T: Serialize + crate::types::MaybeSend,
+        T: Serialize + crate::types::MaybeSend + crate::types::MaybeSync,
     {
         let data = Box::new(data) as Box<DynSerialize>;
-        let is_sync = super::util::is_sync::<T>();
-        let variant = UserDataVariant::Serializable(XRc::new(UserDataCell::new(data)), is_sync);
+        let variant = UserDataVariant::Serializable(XRc::new(RwLock::new(data)));
         Self::Owned(variant)
     }
 

@@ -3,12 +3,10 @@
 use std::cell::Cell;
 use std::fmt::Debug;
 use std::os::raw::c_void;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
-use mlua::{
-    Compiler, Error, Function, Lua, LuaOptions, Result, StdLib, Table, ThreadStatus, Value, Vector, VmState,
-};
+use mlua::{Compiler, Error, Function, Lua, LuaOptions, Result, StdLib, Table, Value, Vector, VmState};
 
 #[test]
 fn test_version() -> Result<()> {
@@ -324,11 +322,11 @@ fn test_interrupts() -> Result<()> {
         .into_function()?,
     )?;
     co.resume::<()>(())?;
-    assert_eq!(co.status(), ThreadStatus::Resumable);
+    assert!(co.is_resumable());
     let result: i32 = co.resume(())?;
     assert_eq!(result, 6);
     assert_eq!(yield_count.load(Ordering::Relaxed), 7);
-    assert_eq!(co.status(), ThreadStatus::Finished);
+    assert!(co.is_finished());
 
     // Test no yielding at non-yieldable points
     yield_count.store(0, Ordering::Relaxed);
@@ -448,7 +446,7 @@ fn test_loadstring() -> Result<()> {
     assert_eq!(f.call::<i32>(())?, 123);
 
     let err = lua
-        .load(r#"loadstring("retur 123", "chunk")"#)
+        .load(r#"loadstring("retur 123", "chunk")"#) // typos:ignore
         .exec()
         .err()
         .unwrap();
@@ -466,6 +464,71 @@ fn test_typeof_error() -> Result<()> {
     let err = Error::runtime("just a test error");
     let res = lua.load("return typeof(...)").call::<String>(err)?;
     assert_eq!(res, "error");
+
+    Ok(())
+}
+
+#[test]
+fn test_memory_category() -> Result<()> {
+    let lua = Lua::new();
+
+    lua.set_memory_category("main").unwrap();
+
+    // Invalid category names should be rejected
+    let err = lua.set_memory_category("invalid$");
+    assert!(err.is_err());
+
+    for i in 0..254 {
+        let name = format!("category_{}", i);
+        lua.set_memory_category(&name).unwrap();
+    }
+    // 255th category should fail
+    let err = lua.set_memory_category("category_254");
+    assert!(err.is_err());
+
+    Ok(())
+}
+
+#[test]
+fn test_heap_dump() -> Result<()> {
+    let lua = Lua::new();
+
+    // Assign a new memory category and create few objects
+    lua.set_memory_category("test_category")?;
+    let _t = lua.create_table()?;
+    let _ud = lua.create_any_userdata("hello, world")?;
+
+    let dump = lua.heap_dump()?;
+
+    assert!(dump.size() > 0);
+    let size_by_category = dump.size_by_category();
+    assert_eq!(size_by_category.len(), 2);
+    assert!(size_by_category.contains_key("test_category"));
+    assert!(size_by_category["main"] < dump.size());
+
+    // Check size by type within the category
+    let size_by_type = dump.size_by_type(Some("test_category"));
+    assert!(!size_by_type.is_empty());
+    assert!(size_by_type.contains_key("table"));
+    assert!(size_by_type.contains_key("userdata"));
+    // Try non-existent category
+    let size_by_type2 = dump.size_by_type(Some("non_existent_category"));
+    assert!(size_by_type2.is_empty());
+    // Remove category filter
+    let size_by_type_all = dump.size_by_type(None);
+    assert!(size_by_type.len() < size_by_type_all.len());
+
+    // Check size by userdata type within the category
+    let size_by_udtype = dump.size_by_userdata(Some("test_category"));
+    assert_eq!(size_by_udtype.len(), 1);
+    assert!(size_by_udtype.contains_key("&str"));
+    assert_eq!(size_by_udtype["&str"].0, 1);
+    // Try non-existent category
+    let size_by_udtype2 = dump.size_by_userdata(Some("non_existent_category"));
+    assert!(size_by_udtype2.is_empty());
+    // Remove category filter
+    let size_by_udtype_all = dump.size_by_userdata(None);
+    assert!(size_by_udtype.len() < size_by_udtype_all.len());
 
     Ok(())
 }

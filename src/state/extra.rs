@@ -14,7 +14,7 @@ use crate::state::RawLua;
 use crate::stdlib::StdLib;
 use crate::types::{AppData, ReentrantMutex, XRc};
 use crate::userdata::RawUserDataRegistry;
-use crate::util::{get_internal_metatable, push_internal_userdata, TypeKey, WrappedFailure};
+use crate::util::{TypeKey, WrappedFailure, get_internal_metatable, push_internal_userdata};
 
 #[cfg(any(feature = "luau", doc))]
 use crate::chunk::Compiler;
@@ -77,7 +77,7 @@ pub(crate) struct ExtraData {
     pub(super) hook_callback: Option<crate::types::HookCallback>,
     #[cfg(not(feature = "luau"))]
     pub(super) hook_triggers: crate::debug::HookTriggers,
-    #[cfg(feature = "lua54")]
+    #[cfg(any(feature = "lua55", feature = "lua54"))]
     pub(super) warn_callback: Option<crate::types::WarnCallback>,
     #[cfg(feature = "luau")]
     pub(super) interrupt_callback: Option<crate::types::InterruptCallback>,
@@ -94,6 +94,8 @@ pub(crate) struct ExtraData {
     pub(super) compiler: Option<Compiler>,
     #[cfg(feature = "luau-jit")]
     pub(super) enable_jit: bool,
+    #[cfg(feature = "luau")]
+    pub(crate) mem_categories: Vec<std::ffi::CString>,
 }
 
 impl Drop for ExtraData {
@@ -180,7 +182,7 @@ impl ExtraData {
             hook_callback: None,
             #[cfg(not(feature = "luau"))]
             hook_triggers: Default::default(),
-            #[cfg(feature = "lua54")]
+            #[cfg(any(feature = "lua55", feature = "lua54"))]
             warn_callback: None,
             #[cfg(feature = "luau")]
             interrupt_callback: None,
@@ -196,6 +198,8 @@ impl ExtraData {
             enable_jit: true,
             #[cfg(feature = "luau")]
             running_gc: false,
+            #[cfg(feature = "luau")]
+            mem_categories: vec![std::ffi::CString::new("main").unwrap()],
         }));
 
         // Store it in the registry

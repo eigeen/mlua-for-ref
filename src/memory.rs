@@ -28,23 +28,10 @@ impl MemoryState {
     }
 
     #[cfg(not(feature = "luau"))]
-    #[rustversion::since(1.85)]
     #[inline]
-    #[allow(clippy::incompatible_msrv)]
     pub(crate) unsafe fn get(state: *mut ffi::lua_State) -> *mut Self {
         let mut mem_state = ptr::null_mut();
         if !ptr::fn_addr_eq(ffi::lua_getallocf(state, &mut mem_state), ALLOCATOR) {
-            mem_state = ptr::null_mut();
-        }
-        mem_state as *mut MemoryState
-    }
-
-    #[cfg(not(feature = "luau"))]
-    #[rustversion::before(1.85)]
-    #[inline]
-    pub(crate) unsafe fn get(state: *mut ffi::lua_State) -> *mut Self {
-        let mut mem_state = ptr::null_mut();
-        if ffi::lua_getallocf(state, &mut mem_state) != ALLOCATOR {
             mem_state = ptr::null_mut();
         }
         mem_state as *mut MemoryState
@@ -83,7 +70,7 @@ impl MemoryState {
     }
 
     // Does nothing apart from calling `f()`, we don't need to bypass any limits
-    #[cfg(any(feature = "lua52", feature = "lua53", feature = "lua54"))]
+    #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53", feature = "lua52"))]
     #[inline]
     pub(crate) unsafe fn relax_limit_with(_state: *mut ffi::lua_State, f: impl FnOnce()) {
         f();

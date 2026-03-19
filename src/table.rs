@@ -1,15 +1,173 @@
+//! Lua table handling.
+//!
+//! Tables are Lua's primary data structure, used for arrays, dictionaries, objects, modules,
+//! and more. This module provides types for creating and manipulating Lua tables from Rust.
+//!
+//! # Main Types
+//!
+//! - [`Table`] - A handle to a Lua table.
+//! - [`TablePairs`] - An iterator over key-value pairs in a table.
+//! - [`TableSequence`] - An iterator over the array (sequence) portion of a table.
+//!
+//! # Basic Operations
+//!
+//! Tables support key-value access similar to Rust's `HashMap`:
+//!
+//! ```
+//! # use mlua::{Lua, Result};
+//! # fn main() -> Result<()> {
+//! let lua = Lua::new();
+//! let table = lua.create_table()?;
+//!
+//! // Set and get values
+//! table.set("key", "value")?;
+//! let value: String = table.get("key")?;
+//! assert_eq!(value, "value");
+//!
+//! // Keys and values can be any Lua-compatible type
+//! table.set(1, "first")?;
+//! table.set("nested", lua.create_table()?)?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Array Operations
+//!
+//! Tables can be used as arrays with 1-based indexing:
+//!
+//! ```
+//! # use mlua::{Lua, Result};
+//! # fn main() -> Result<()> {
+//! let lua = Lua::new();
+//! let array = lua.create_table()?;
+//!
+//! // Push values to the end (like Vec::push)
+//! array.push("first")?;
+//! array.push("second")?;
+//! array.push("third")?;
+//!
+//! // Pop from the end
+//! let last: String = array.pop()?;
+//! assert_eq!(last, "third");
+//!
+//! // Get length
+//! assert_eq!(array.raw_len(), 2);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Iteration
+//!
+//! Iterate over all key-value pairs with [`Table::pairs`]:
+//!
+//! ```
+//! # use mlua::{Lua, Result, Value};
+//! # fn main() -> Result<()> {
+//! let lua = Lua::new();
+//! let table = lua.create_table()?;
+//! table.set("a", 1)?;
+//! table.set("b", 2)?;
+//!
+//! for pair in table.pairs::<String, i32>() {
+//!     let (key, value) = pair?;
+//!     println!("{key} = {value}");
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! For array portions, use [`Table::sequence_values`]:
+//!
+//! ```
+//! # use mlua::{Lua, Result};
+//! # fn main() -> Result<()> {
+//! let lua = Lua::new();
+//! let array = lua.create_sequence_from(["a", "b", "c"])?;
+//!
+//! for value in array.sequence_values::<String>() {
+//!     println!("{}", value?);
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Raw vs Normal Access
+//!
+//! Methods prefixed with `raw_` (like [`Table::raw_get`], [`Table::raw_set`]) bypass
+//! metamethods, directly accessing the table's contents. Normal methods may trigger
+//! `__index`, `__newindex`, and other metamethods:
+//!
+//! ```
+//! # use mlua::{Lua, Result};
+//! # fn main() -> Result<()> {
+//! let lua = Lua::new();
+//!
+//! // raw_set bypasses __newindex metamethod
+//! let t = lua.create_table()?;
+//! t.raw_set("key", "value")?;
+//!
+//! // raw_get bypasses __index metamethod
+//! let v: String = t.raw_get("key")?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Metatables
+//!
+//! Tables can have metatables that customize their behavior:
+//!
+//! ```
+//! # use mlua::{Lua, Result};
+//! # fn main() -> Result<()> {
+//! let lua = Lua::new();
+//!
+//! let table = lua.create_table()?;
+//! let metatable = lua.create_table()?;
+//!
+//! // Set a default value via __index
+//! metatable.set("__index", lua.create_function(|_, _: ()| Ok("default"))?)?;
+//! table.set_metatable(Some(metatable))?;
+//!
+//! // Accessing missing keys returns "default"
+//! let value: String = table.get("missing")?;
+//! assert_eq!(value, "default");
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Global Table
+//!
+//! The Lua global environment is itself a table, accessible via [`Lua::globals`]:
+//!
+//! ```
+//! # use mlua::{Lua, Result};
+//! # fn main() -> Result<()> {
+//! let lua = Lua::new();
+//! let globals = lua.globals();
+//!
+//! // Set a global variable
+//! globals.set("my_var", 42)?;
+//!
+//! // Now accessible from Lua code
+//! let result: i32 = lua.load("my_var + 8").eval()?;
+//! assert_eq!(result, 50);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! [`Lua::globals`]: crate::Lua::globals
+
 use std::collections::HashSet;
 use std::fmt;
 use std::marker::PhantomData;
-use std::os::raw::{c_int, c_void};
-use std::string::String as StdString;
+use std::os::raw::c_void;
 
 use crate::error::{Error, Result};
 use crate::function::Function;
 use crate::state::{LuaGuard, RawLua, WeakLua};
 use crate::traits::{FromLua, FromLuaMulti, IntoLua, IntoLuaMulti, ObjectLike};
-use crate::types::{Integer, LuaType, ValueRef};
-use crate::util::{assert_stack, check_stack, get_metatable_ptr, StackGuard};
+use crate::types::{Integer, ValueRef};
+use crate::util::{StackGuard, assert_stack, check_stack, get_metatable_ptr};
 use crate::value::{Nil, Value};
 
 #[cfg(feature = "async")]
@@ -226,15 +384,15 @@ impl Table {
         // Compare using `__eq` metamethod if exists
         // First, check the self for the metamethod.
         // If self does not define it, then check the other table.
-        if let Some(mt) = self.metatable() {
-            if mt.contains_key("__eq")? {
-                return mt.get::<Function>("__eq")?.call((self, other));
-            }
+        if let Some(mt) = self.metatable()
+            && let Some(eq_func) = mt.get::<Option<Function>>("__eq")?
+        {
+            return eq_func.call((self, other));
         }
-        if let Some(mt) = other.metatable() {
-            if mt.contains_key("__eq")? {
-                return mt.get::<Function>("__eq")?.call((self, other));
-            }
+        if let Some(mt) = other.metatable()
+            && let Some(eq_func) = mt.get::<Option<Function>>("__eq")?
+        {
+            return eq_func.call((self, other));
         }
 
         Ok(false)
@@ -935,10 +1093,6 @@ where
     }
 }
 
-impl LuaType for Table {
-    const TYPE_ID: c_int = ffi::LUA_TTABLE;
-}
-
 impl ObjectLike for Table {
     #[inline]
     fn get<V: FromLua>(&self, key: impl IntoLua) -> Result<V> {
@@ -1012,7 +1166,7 @@ impl ObjectLike for Table {
     }
 
     #[inline]
-    fn to_string(&self) -> Result<StdString> {
+    fn to_string(&self) -> Result<String> {
         Value::Table(Table(self.0.clone())).to_string()
     }
 
@@ -1074,7 +1228,7 @@ impl Serialize for SerializableTable<'_> {
     where
         S: Serializer,
     {
-        use crate::serde::de::{check_value_for_skip, MapPairs, RecursionGuard};
+        use crate::serde::de::{MapPairs, RecursionGuard, check_value_for_skip};
         use crate::value::SerializableValue;
 
         let convert_result = |res: Result<()>, serialize_err: Option<S::Error>| match res {
@@ -1102,7 +1256,7 @@ impl Serialize for SerializableTable<'_> {
                 seq.serialize_element(&SerializableValue::new(&value, options, Some(visited)))
                     .map_err(|err| {
                         serialize_err = Some(err);
-                        Error::SerializeError(StdString::new())
+                        Error::SerializeError(String::new())
                     })
             });
             convert_result(res, serialize_err)?;
@@ -1127,7 +1281,7 @@ impl Serialize for SerializableTable<'_> {
             )
             .map_err(|err| {
                 serialize_err = Some(err);
-                Error::SerializeError(StdString::new())
+                Error::SerializeError(String::new())
             })
         };
 

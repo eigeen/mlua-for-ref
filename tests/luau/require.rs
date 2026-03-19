@@ -1,7 +1,8 @@
 use std::io::Result as IoResult;
 use std::result::Result as StdResult;
 
-use mlua::{Error, IntoLua, Lua, MultiValue, NavigateError, Require, Result, TextRequirer, Value};
+use mlua::luau::{FsRequirer, NavigateError, Require};
+use mlua::{Error, FromLua, IntoLua, Lua, MultiValue, Result, Value};
 
 fn run_require(lua: &Lua, path: impl IntoLua) -> Result<Value> {
     lua.load(r#"return require(...)"#).call(path)
@@ -12,8 +13,13 @@ fn run_require_pcall(lua: &Lua, path: impl IntoLua) -> Result<MultiValue> {
 }
 
 #[track_caller]
+fn get_value<V: FromLua>(value: &Value, key: impl IntoLua) -> V {
+    value.as_table().unwrap().get(key).unwrap()
+}
+
+#[track_caller]
 fn get_str(value: &Value, key: impl IntoLua) -> String {
-    value.as_table().unwrap().get::<String>(key).unwrap()
+    get_value(value, key)
 }
 
 #[test]
@@ -37,8 +43,10 @@ fn test_require_errors() {
     // Pass non-string to require
     let res = run_require(&lua, true);
     assert!(res.is_err());
-    assert!((res.unwrap_err().to_string())
-        .contains("bad argument #1 to 'require' (string expected, got boolean)"));
+    assert!(
+        (res.unwrap_err().to_string())
+            .contains("bad argument #1 to 'require' (string expected, got boolean)")
+    );
 
     // Require from loadstring
     let res = lua
@@ -47,8 +55,18 @@ fn test_require_errors() {
     assert!(res.is_err());
     assert!((res.unwrap_err().to_string()).contains("require is not supported in this context"));
 
+    // RequireAliasThatDoesNotExist
+    let res = run_require(&lua, "@this.alias.does.not.exist");
+    assert!(res.is_err());
+    assert!((res.unwrap_err().to_string()).contains("@this.alias.does.not.exist is not a valid alias"));
+
+    // IllegalAlias
+    let res = run_require(&lua, "@");
+    assert!(res.is_err());
+    assert!((res.unwrap_err().to_string()).contains("@ is not a valid alias"));
+
     // Test throwing mlua::Error
-    struct MyRequire(TextRequirer);
+    struct MyRequire(FsRequirer);
 
     impl Require for MyRequire {
         fn is_require_allowed(&self, chunk_name: &str) -> bool {
@@ -92,9 +110,7 @@ fn test_require_errors() {
         }
     }
 
-    let require = lua
-        .create_require_function(MyRequire(TextRequirer::new()))
-        .unwrap();
+    let require = lua.create_require_function(MyRequire(FsRequirer::new())).unwrap();
     lua.globals().set("require", require).unwrap();
     let res = lua.load(r#"return require('./a/relative/path')"#).exec();
     assert!((res.unwrap_err().to_string()).contains("test error"));
@@ -154,8 +170,10 @@ fn test_require_without_config() {
         "./tests/luau/require/without_config/ambiguous_file_requirer",
     );
     assert!(res.is_err());
-    assert!((res.unwrap_err().to_string())
-        .contains("could not resolve child component \"dependency\" (ambiguous)"));
+    assert!(
+        (res.unwrap_err().to_string())
+            .contains("could not resolve child component \"dependency\" (ambiguous)")
+    );
 
     // RequireWithDirectoryAmbiguity
     let res = run_require(
@@ -163,48 +181,74 @@ fn test_require_without_config() {
         "./tests/luau/require/without_config/ambiguous_directory_requirer",
     );
     assert!(res.is_err());
-    assert!((res.unwrap_err().to_string())
-        .contains("could not resolve child component \"dependency\" (ambiguous)"));
+    assert!(
+        (res.unwrap_err().to_string())
+            .contains("could not resolve child component \"dependency\" (ambiguous)")
+    );
 
     // CheckCachedResult
     let res = run_require(&lua, "./tests/luau/require/without_config/validate_cache").unwrap();
     assert!(res.is_table());
 }
 
-#[test]
-fn test_require_with_config() {
+fn test_require_with_config_inner(r#type: &str) {
     let lua = Lua::new();
 
+    let base_path = format!("./tests/luau/require/{type}");
+
     // RequirePathWithAlias
-    let res = run_require(&lua, "./tests/luau/require/with_config/src/alias_requirer").unwrap();
+    let res = run_require(&lua, format!("{base_path}/src/alias_requirer")).unwrap();
     assert_eq!("result from dependency", get_str(&res, 1));
 
     // RequirePathWithAlias (case-insensitive)
-    let res2 = run_require(&lua, "./tests/luau/require/with_config/src/alias_requirer_uc").unwrap();
+    let res2 = run_require(&lua, format!("{base_path}/src/alias_requirer_uc")).unwrap();
     assert_eq!("result from dependency", get_str(&res2, 1));
     assert_eq!(res.to_pointer(), res2.to_pointer());
 
     // RequirePathWithParentAlias
-    let res = run_require(&lua, "./tests/luau/require/with_config/src/parent_alias_requirer").unwrap();
+    let res = run_require(&lua, format!("{base_path}/src/parent_alias_requirer")).unwrap();
     assert_eq!("result from other_dependency", get_str(&res, 1));
 
     // RequirePathWithAliasPointingToDirectory
-    let res = run_require(
-        &lua,
-        "./tests/luau/require/with_config/src/directory_alias_requirer",
-    )
-    .unwrap();
+    let res = run_require(&lua, format!("{base_path}/src/directory_alias_requirer")).unwrap();
     assert_eq!("result from subdirectory_dependency", get_str(&res, 1));
 
-    // RequireAliasThatDoesNotExist
-    let res = run_require(&lua, "@this.alias.does.not.exist");
-    assert!(res.is_err());
-    assert!((res.unwrap_err().to_string()).contains("@this.alias.does.not.exist is not a valid alias"));
+    // RequireChainedAliasesSuccess
+    let res = run_require(
+        &lua,
+        format!("{base_path}/chained_aliases/subdirectory/successful_requirer"),
+    )
+    .unwrap();
+    assert_eq!("result from inner_dependency", get_str(&get_value(&res, 1), 1));
+    assert_eq!("result from outer_dependency", get_str(&get_value(&res, 2), 1));
 
-    // IllegalAlias
-    let res = run_require(&lua, "@");
+    // RequireChainedAliasesFailureCyclic
+    let res = run_require(
+        &lua,
+        format!("{base_path}/chained_aliases/subdirectory/failing_requirer_cyclic"),
+    );
     assert!(res.is_err());
-    assert!((res.unwrap_err().to_string()).contains("@ is not a valid alias"));
+    let err_msg = "error requiring module \"@cyclicentry\": detected alias cycle (@cyclic1 -> @cyclic2 -> @cyclic3 -> @cyclic1)";
+    assert!(res.unwrap_err().to_string().contains(err_msg));
+
+    // RequireChainedAliasesFailureMissing
+    let res = run_require(
+        &lua,
+        format!("{base_path}/chained_aliases/subdirectory/failing_requirer_missing"),
+    );
+    assert!(res.is_err());
+    let err_msg = "error requiring module \"@brokenchain\": @missing is not a valid alias";
+    assert!(res.unwrap_err().to_string().contains(err_msg));
+}
+
+#[test]
+fn test_require_with_config() {
+    test_require_with_config_inner("with_config");
+}
+
+#[test]
+fn test_require_with_config_luau() {
+    test_require_with_config_inner("with_config_luau");
 }
 
 #[cfg(all(feature = "async", not(windows)))]

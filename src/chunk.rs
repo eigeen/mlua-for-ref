@@ -1,10 +1,16 @@
+//! Lua chunk loading and execution.
+//!
+//! This module provides types for loading Lua source code or bytecode into a [`Chunk`],
+//! configuring how it is compiled and executed, and converting it into a callable [`Function`].
+//!
+//! Chunks can be loaded from strings, byte slices, or files via the [`AsChunk`] trait.
+
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::io::Result as IoResult;
 use std::panic::Location;
 use std::path::{Path, PathBuf};
-use std::string::String as StdString;
 
 use crate::error::{Error, Result};
 use crate::function::Function;
@@ -20,7 +26,7 @@ pub trait AsChunk {
     /// Returns optional chunk name
     ///
     /// See [`Chunk::set_name`] for possible name prefixes.
-    fn name(&self) -> Option<StdString> {
+    fn name(&self) -> Option<String> {
         None
     }
 
@@ -52,13 +58,13 @@ impl AsChunk for &str {
     }
 }
 
-impl AsChunk for StdString {
+impl AsChunk for String {
     fn source<'a>(&self) -> IoResult<Cow<'a, [u8]>> {
         Ok(Cow::Owned(self.clone().into_bytes()))
     }
 }
 
-impl AsChunk for &StdString {
+impl AsChunk for &String {
     fn source<'a>(&self) -> IoResult<Cow<'a, [u8]>>
     where
         Self: 'a,
@@ -92,7 +98,7 @@ impl AsChunk for &Vec<u8> {
 }
 
 impl AsChunk for &Path {
-    fn name(&self) -> Option<StdString> {
+    fn name(&self) -> Option<String> {
         Some(format!("@{}", self.display()))
     }
 
@@ -102,7 +108,7 @@ impl AsChunk for &Path {
 }
 
 impl AsChunk for PathBuf {
-    fn name(&self) -> Option<StdString> {
+    fn name(&self) -> Option<String> {
         Some(format!("@{}", self.display()))
     }
 
@@ -112,7 +118,7 @@ impl AsChunk for PathBuf {
 }
 
 impl<C: AsChunk + ?Sized> AsChunk for Box<C> {
-    fn name(&self) -> Option<StdString> {
+    fn name(&self) -> Option<String> {
         (**self).name()
     }
 
@@ -136,7 +142,7 @@ impl<C: AsChunk + ?Sized> AsChunk for Box<C> {
 #[must_use = "`Chunk`s do nothing unless one of `exec`, `eval`, `call`, or `into_function` are called on them"]
 pub struct Chunk<'a> {
     pub(crate) lua: WeakLua,
-    pub(crate) name: StdString,
+    pub(crate) name: String,
     pub(crate) env: Result<Option<Table>>,
     pub(crate) mode: Option<ChunkMode>,
     pub(crate) source: IoResult<Cow<'a, [u8]>>,
@@ -160,7 +166,7 @@ pub enum CompileConstant {
     Boolean(bool),
     Number(crate::Number),
     Vector(crate::Vector),
-    String(StdString),
+    String(String),
 }
 
 #[cfg(any(feature = "luau", doc))]
@@ -192,7 +198,7 @@ impl From<&str> for CompileConstant {
 }
 
 #[cfg(any(feature = "luau", doc))]
-type LibraryMemberConstantMap = HashMap<(StdString, StdString), CompileConstant>;
+type LibraryMemberConstantMap = HashMap<(String, String), CompileConstant>;
 
 /// Luau compiler
 #[cfg(any(feature = "luau", doc))]
@@ -203,14 +209,14 @@ pub struct Compiler {
     debug_level: u8,
     type_info_level: u8,
     coverage_level: u8,
-    vector_lib: Option<StdString>,
-    vector_ctor: Option<StdString>,
-    vector_type: Option<StdString>,
-    mutable_globals: Vec<StdString>,
-    userdata_types: Vec<StdString>,
-    libraries_with_known_members: Vec<StdString>,
+    vector_lib: Option<String>,
+    vector_ctor: Option<String>,
+    vector_type: Option<String>,
+    mutable_globals: Vec<String>,
+    userdata_types: Vec<String>,
+    libraries_with_known_members: Vec<String>,
     library_constants: Option<LibraryMemberConstantMap>,
-    disabled_builtins: Vec<StdString>,
+    disabled_builtins: Vec<String>,
 }
 
 #[cfg(any(feature = "luau", doc))]
@@ -294,7 +300,7 @@ impl Compiler {
     /// To set the library and method name, use the `lib.ctor` format.
     #[doc(hidden)]
     #[must_use]
-    pub fn set_vector_ctor(mut self, ctor: impl Into<StdString>) -> Self {
+    pub fn set_vector_ctor(mut self, ctor: impl Into<String>) -> Self {
         let ctor = ctor.into();
         let lib_ctor = ctor.split_once('.');
         self.vector_lib = lib_ctor.as_ref().map(|&(lib, _)| lib.to_owned());
@@ -307,7 +313,7 @@ impl Compiler {
     /// Sets alternative vector type name for type tables, in addition to default type `vector`.
     #[doc(hidden)]
     #[must_use]
-    pub fn set_vector_type(mut self, r#type: impl Into<StdString>) -> Self {
+    pub fn set_vector_type(mut self, r#type: impl Into<String>) -> Self {
         self.vector_type = Some(r#type.into());
         self
     }
@@ -316,7 +322,7 @@ impl Compiler {
     ///
     /// It disables the import optimization for fields accessed through it.
     #[must_use]
-    pub fn add_mutable_global(mut self, global: impl Into<StdString>) -> Self {
+    pub fn add_mutable_global(mut self, global: impl Into<String>) -> Self {
         self.mutable_globals.push(global.into());
         self
     }
@@ -325,21 +331,21 @@ impl Compiler {
     ///
     /// It disables the import optimization for fields accessed through these.
     #[must_use]
-    pub fn set_mutable_globals<S: Into<StdString>>(mut self, globals: impl IntoIterator<Item = S>) -> Self {
+    pub fn set_mutable_globals<S: Into<String>>(mut self, globals: impl IntoIterator<Item = S>) -> Self {
         self.mutable_globals = globals.into_iter().map(|s| s.into()).collect();
         self
     }
 
     /// Adds a userdata type to the list that will be included in the type information.
     #[must_use]
-    pub fn add_userdata_type(mut self, r#type: impl Into<StdString>) -> Self {
+    pub fn add_userdata_type(mut self, r#type: impl Into<String>) -> Self {
         self.userdata_types.push(r#type.into());
         self
     }
 
     /// Sets a list of userdata types that will be included in the type information.
     #[must_use]
-    pub fn set_userdata_types<S: Into<StdString>>(mut self, types: impl IntoIterator<Item = S>) -> Self {
+    pub fn set_userdata_types<S: Into<String>>(mut self, types: impl IntoIterator<Item = S>) -> Self {
         self.userdata_types = types.into_iter().map(|s| s.into()).collect();
         self
     }
@@ -366,24 +372,21 @@ impl Compiler {
             self.libraries_with_known_members.push(lib.clone());
         }
         self.library_constants
-            .get_or_insert_with(HashMap::new)
+            .get_or_insert_default()
             .insert((lib, member), r#const.into());
         self
     }
 
     /// Adds a builtin that should be disabled.
     #[must_use]
-    pub fn add_disabled_builtin(mut self, builtin: impl Into<StdString>) -> Self {
+    pub fn add_disabled_builtin(mut self, builtin: impl Into<String>) -> Self {
         self.disabled_builtins.push(builtin.into());
         self
     }
 
     /// Sets a list of builtins that should be disabled.
     #[must_use]
-    pub fn set_disabled_builtins<S: Into<StdString>>(
-        mut self,
-        builtins: impl IntoIterator<Item = S>,
-    ) -> Self {
+    pub fn set_disabled_builtins<S: Into<String>>(mut self, builtins: impl IntoIterator<Item = S>) -> Self {
         self.disabled_builtins = builtins.into_iter().map(|s| s.into()).collect();
         self
     }
@@ -477,11 +480,11 @@ impl Compiler {
             options.mutableGlobals = mutable_globals_ptr;
             options.userdataTypes = userdata_types_ptr;
             options.librariesWithKnownMembers = libraries_with_known_members_ptr;
-            if let Some(map) = self.library_constants.as_ref() {
-                if !self.libraries_with_known_members.is_empty() {
-                    LIBRARY_MEMBER_CONSTANT_MAP.with_borrow_mut(|gmap| *gmap = map.clone());
-                    options.libraryMemberConstantCallback = Some(library_member_constant_callback);
-                }
+            if let Some(map) = self.library_constants.as_ref()
+                && !self.libraries_with_known_members.is_empty()
+            {
+                LIBRARY_MEMBER_CONSTANT_MAP.with_borrow_mut(|gmap| *gmap = map.clone());
+                options.libraryMemberConstantCallback = Some(library_member_constant_callback);
             }
             options.disabledBuiltins = disabled_builtins_ptr;
             ffi::luau_compile(source.as_ref(), options)
@@ -490,7 +493,7 @@ impl Compiler {
         if bytecode.first() == Some(&0) {
             // The rest of the bytecode is the error message starting with `:`
             // See https://github.com/luau-lang/luau/blob/0.640/Compiler/src/Compiler.cpp#L4336
-            let message = StdString::from_utf8_lossy(&bytecode[2..]).into_owned();
+            let message = String::from_utf8_lossy(&bytecode[2..]).into_owned();
             return Err(Error::SyntaxError {
                 incomplete_input: message.ends_with("<eof>"),
                 message,
@@ -513,7 +516,7 @@ impl Chunk<'_> {
     /// - `@` - file path (when truncation is needed, the end of the file path is kept, as this is
     ///   more useful for identifying the file)
     /// - `=` - custom chunk name (when truncation is needed, the beginning of the name is kept)
-    pub fn set_name(mut self, name: impl Into<StdString>) -> Self {
+    pub fn set_name(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
         self
     }
@@ -662,19 +665,19 @@ impl Chunk<'_> {
     ///
     /// It does nothing if the chunk is already binary or invalid.
     fn compile(&mut self) {
-        if let Ok(ref source) = self.source {
-            if self.detect_mode() == ChunkMode::Text {
-                #[cfg(feature = "luau")]
-                if let Ok(data) = self.compiler.get_or_insert_with(Default::default).compile(source) {
-                    self.source = Ok(Cow::Owned(data));
-                    self.mode = Some(ChunkMode::Binary);
-                }
-                #[cfg(not(feature = "luau"))]
-                if let Ok(func) = self.lua.lock().load_chunk(None, None, None, source.as_ref()) {
-                    let data = func.dump(false);
-                    self.source = Ok(Cow::Owned(data));
-                    self.mode = Some(ChunkMode::Binary);
-                }
+        if let Ok(ref source) = self.source
+            && self.detect_mode() == ChunkMode::Text
+        {
+            #[cfg(feature = "luau")]
+            if let Ok(data) = self.compiler.get_or_insert_default().compile(source) {
+                self.source = Ok(Cow::Owned(data));
+                self.mode = Some(ChunkMode::Binary);
+            }
+            #[cfg(not(feature = "luau"))]
+            if let Ok(func) = self.lua.lock().load_chunk(None, None, None, source.as_ref()) {
+                let data = func.dump(false);
+                self.source = Ok(Cow::Owned(data));
+                self.mode = Some(ChunkMode::Binary);
             }
         }
     }
@@ -687,33 +690,33 @@ impl Chunk<'_> {
 
         // Try to fetch compiled chunk from cache
         let mut text_source = None;
-        if let Ok(ref source) = self.source {
-            if self.detect_mode() == ChunkMode::Text {
-                let lua = self.lua.lock();
-                if let Some(cache) = lua.priv_app_data_ref::<ChunksCache>() {
-                    if let Some(data) = cache.0.get(source.as_ref()) {
-                        self.source = Ok(Cow::Owned(data.clone()));
-                        self.mode = Some(ChunkMode::Binary);
-                        return self;
-                    }
-                }
-                text_source = Some(source.as_ref().to_vec());
+        if let Ok(ref source) = self.source
+            && self.detect_mode() == ChunkMode::Text
+        {
+            let lua = self.lua.lock();
+            if let Some(cache) = lua.priv_app_data_ref::<ChunksCache>()
+                && let Some(data) = cache.0.get(source.as_ref())
+            {
+                self.source = Ok(Cow::Owned(data.clone()));
+                self.mode = Some(ChunkMode::Binary);
+                return self;
             }
+            text_source = Some(source.as_ref().to_vec());
         }
 
         // Compile and cache the chunk
         if let Some(text_source) = text_source {
             self.compile();
-            if let Ok(ref binary_source) = self.source {
-                if self.detect_mode() == ChunkMode::Binary {
-                    let lua = self.lua.lock();
-                    if let Some(mut cache) = lua.priv_app_data_mut::<ChunksCache>() {
-                        cache.0.insert(text_source, binary_source.to_vec());
-                    } else {
-                        let mut cache = ChunksCache(HashMap::new());
-                        cache.0.insert(text_source, binary_source.to_vec());
-                        lua.set_priv_app_data(cache);
-                    };
+            if let Ok(ref binary_source) = self.source
+                && self.detect_mode() == ChunkMode::Binary
+            {
+                let lua = self.lua.lock();
+                if let Some(mut cache) = lua.priv_app_data_mut::<ChunksCache>() {
+                    cache.0.insert(text_source, binary_source.to_vec());
+                } else {
+                    let mut cache = ChunksCache(HashMap::new());
+                    cache.0.insert(text_source, binary_source.to_vec());
+                    lua.set_priv_app_data(cache);
                 }
             }
         }
@@ -761,7 +764,7 @@ impl Chunk<'_> {
         ChunkMode::Text
     }
 
-    fn convert_name(name: StdString) -> Result<CString> {
+    fn convert_name(name: String) -> Result<CString> {
         CString::new(name).map_err(|err| Error::runtime(format!("invalid name: {err}")))
     }
 
@@ -783,7 +786,6 @@ impl Chunk<'_> {
     ///
     /// The resulted `IntoLua` implementation will convert the chunk into a Lua function without
     /// executing it.
-    #[doc(hidden)]
     #[track_caller]
     pub fn wrap(chunk: impl AsChunk) -> impl IntoLua {
         WrappedChunk {

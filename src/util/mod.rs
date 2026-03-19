@@ -6,16 +6,16 @@ use std::{ptr, slice, str};
 use crate::error::{Error, Result};
 
 pub(crate) use error::{
-    error_traceback, error_traceback_thread, init_error_registry, pop_error, protect_lua_call,
-    protect_lua_closure, WrappedFailure,
+    WrappedFailure, error_traceback, error_traceback_thread, init_error_registry, pop_error,
+    protect_lua_call, protect_lua_closure,
 };
 pub(crate) use path::parse_path as parse_lookup_path;
 pub(crate) use short_names::short_type_name;
 pub(crate) use types::TypeKey;
 pub(crate) use userdata::{
-    get_destructed_userdata_metatable, get_internal_metatable, get_internal_userdata, get_userdata,
-    init_internal_metatable, push_internal_userdata, push_userdata, take_userdata,
-    DESTRUCTED_USERDATA_METATABLE,
+    DESTRUCTED_USERDATA_METATABLE, get_destructed_userdata_metatable, get_internal_metatable,
+    get_internal_userdata, get_userdata, init_internal_metatable, push_internal_userdata, push_userdata,
+    take_userdata,
 };
 
 #[cfg(not(feature = "luau"))]
@@ -97,6 +97,38 @@ pub(crate) unsafe fn push_string(state: *mut ffi::lua_State, s: &[u8], protect: 
         ffi::lua_pushlstring(state, s.as_ptr() as *const c_char, s.len());
         Ok(())
     }
+}
+
+// Uses 3 (or 1 if unprotected) stack spaces, does not call checkstack.
+#[cfg(feature = "lua55")]
+pub(crate) unsafe fn push_external_string(
+    state: *mut ffi::lua_State,
+    mut bytes: Vec<u8>,
+    protect: bool,
+) -> Result<()> {
+    bytes.push(0);
+    let s_len = bytes.len() - 1; // exclude null terminator
+    let s_ptr = bytes.as_ptr() as *const c_char;
+    let bytes_ud = Box::into_raw(Box::new(bytes));
+
+    unsafe extern "C" fn dealloc(ud: *mut c_void, _: *mut c_void, _: usize, _: usize) -> *mut c_void {
+        drop(Box::from_raw(ud as *mut Vec<u8>));
+        ptr::null_mut()
+    }
+
+    if protect {
+        let res = protect_lua!(state, 0, 1, move |state| {
+            ffi::lua_pushexternalstring(state, s_ptr, s_len, Some(dealloc), bytes_ud as *mut _);
+        });
+        if res.is_err() {
+            // Deallocate on error
+            drop(Box::from_raw(bytes_ud));
+            return res;
+        }
+    } else {
+        ffi::lua_pushexternalstring(state, s_ptr, s_len, Some(dealloc), bytes_ud as *mut _);
+    }
+    Ok(())
 }
 
 // Uses 3 stack spaces (when protect), does not call checkstack.
@@ -220,7 +252,7 @@ pub(crate) unsafe extern "C-unwind" fn safe_xpcall(state: *mut ffi::lua_State) -
 // Returns Lua main thread for Lua >= 5.2 or checks that the passed thread is main for Lua 5.1.
 // Does not call lua_checkstack, uses 1 stack space.
 pub(crate) unsafe fn get_main_state(state: *mut ffi::lua_State) -> Option<*mut ffi::lua_State> {
-    #[cfg(any(feature = "lua54", feature = "lua53", feature = "lua52"))]
+    #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53", feature = "lua52"))]
     {
         ffi::lua_rawgeti(state, ffi::LUA_REGISTRYINDEX, ffi::LUA_RIDX_MAINTHREAD);
         let main_state = ffi::lua_tothread(state, -1);
@@ -232,11 +264,7 @@ pub(crate) unsafe fn get_main_state(state: *mut ffi::lua_State) -> Option<*mut f
         // Check the current state first
         let is_main_state = ffi::lua_pushthread(state) == 1;
         ffi::lua_pop(state, 1);
-        if is_main_state {
-            Some(state)
-        } else {
-            None
-        }
+        if is_main_state { Some(state) } else { None }
     }
     #[cfg(feature = "luau")]
     Some(ffi::lua_mainthread(state))

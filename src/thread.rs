@@ -1,3 +1,40 @@
+//! Lua thread (coroutine) handling.
+//!
+//! This module provides types for creating and working with Lua coroutines from Rust.
+//! Coroutines allow cooperative multitasking within a single Lua state by suspending and
+//! resuming execution at well-defined yield points.
+//!
+//! # Basic Usage
+//!
+//! Threads are created via [`Lua::create_thread`] and driven by calling [`Thread::resume`]:
+//!
+//! ```rust
+//! # use mlua::{Lua, Result, Thread};
+//! # fn main() -> Result<()> {
+//! let lua = Lua::new();
+//! let thread: Thread = lua.load(r#"
+//!     coroutine.create(function(a, b)
+//!         coroutine.yield(a + b)
+//!         return a * b
+//!     end)
+//! "#).eval()?;
+//!
+//! assert_eq!(thread.resume::<i32>((3, 4))?, 7);
+//! assert_eq!(thread.resume::<i32>(())?,    12);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Async Support
+//!
+//! When the `async` feature is enabled, a [`Thread`] can be converted into an [`AsyncThread`]
+//! via [`Thread::into_async`], which implements both [`Future`] and [`Stream`].
+//! This integrates Lua coroutines naturally with Rust async runtimes such as Tokio.
+//!
+//! [`Lua::create_thread`]: crate::Lua::create_thread
+//! [`Future`]: std::future::Future
+//! [`Stream`]: futures_util::stream::Stream
+
 use std::fmt;
 use std::os::raw::{c_int, c_void};
 
@@ -6,7 +43,7 @@ use crate::function::Function;
 use crate::state::RawLua;
 use crate::traits::{FromLuaMulti, IntoLuaMulti};
 use crate::types::{LuaType, ValueRef};
-use crate::util::{check_stack, error_traceback_thread, pop_error, StackGuard};
+use crate::util::{StackGuard, check_stack, error_traceback_thread, pop_error};
 
 #[cfg(not(feature = "luau"))]
 use crate::{
@@ -69,7 +106,7 @@ impl ThreadStatusInner {
 }
 
 /// Handle to an internal Lua thread (coroutine).
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct Thread(pub(crate) ValueRef, pub(crate) *mut ffi::lua_State);
 
 #[cfg(feature = "send")]
@@ -92,7 +129,6 @@ pub struct AsyncThread<R> {
 
 impl Thread {
     /// Returns reference to the Lua state that this thread is associated with.
-    #[doc(hidden)]
     #[inline(always)]
     pub fn state(&self) -> *mut ffi::lua_State {
         self.1
@@ -259,6 +295,31 @@ impl Thread {
         }
     }
 
+    /// Returns `true` if this thread is resumable (meaning it can be resumed by calling
+    /// [`Thread::resume`]).
+    #[inline(always)]
+    pub fn is_resumable(&self) -> bool {
+        self.status() == ThreadStatus::Resumable
+    }
+
+    /// Returns `true` if this thread is currently running.
+    #[inline(always)]
+    pub fn is_running(&self) -> bool {
+        self.status() == ThreadStatus::Running
+    }
+
+    /// Returns `true` if this thread has finished executing.
+    #[inline(always)]
+    pub fn is_finished(&self) -> bool {
+        self.status() == ThreadStatus::Finished
+    }
+
+    /// Returns `true` if this thread has raised a Lua error during execution.
+    #[inline(always)]
+    pub fn is_error(&self) -> bool {
+        self.status() == ThreadStatus::Error
+    }
+
     /// Sets a hook function that will periodically be called as Lua code executes.
     ///
     /// This function is similar or [`Lua::set_hook`] except that it sets for the thread.
@@ -336,22 +397,22 @@ impl Thread {
             }
             ThreadStatusInner::Running => Err(Error::runtime("cannot reset a running thread")),
             ThreadStatusInner::Finished => Ok(()),
-            #[cfg(not(any(feature = "lua54", feature = "luau")))]
+            #[cfg(not(any(feature = "lua55", feature = "lua54", feature = "luau")))]
             ThreadStatusInner::Yielded(_) | ThreadStatusInner::Error => {
                 Err(Error::runtime("cannot reset non-finished thread"))
             }
-            #[cfg(any(feature = "lua54", feature = "luau"))]
+            #[cfg(any(feature = "lua55", feature = "lua54", feature = "luau"))]
             ThreadStatusInner::Yielded(_) | ThreadStatusInner::Error => {
                 let thread_state = self.state();
 
                 #[cfg(all(feature = "lua54", not(feature = "vendored")))]
                 let status = ffi::lua_resetthread(thread_state);
-                #[cfg(all(feature = "lua54", feature = "vendored"))]
+                #[cfg(any(feature = "lua55", all(feature = "lua54", feature = "vendored")))]
                 let status = {
                     let lua = self.0.lua.lock();
                     ffi::lua_closethread(thread_state, lua.state())
                 };
-                #[cfg(feature = "lua54")]
+                #[cfg(any(feature = "lua55", feature = "lua54"))]
                 if status != ffi::LUA_OK {
                     return Err(pop_error(thread_state, status));
                 }
@@ -449,6 +510,8 @@ impl Thread {
     /// Please note that Luau links environment table with chunk when loading it into Lua state.
     /// Therefore you need to load chunks into a thread to link with the thread environment.
     ///
+    /// [`Lua::sandbox`]: crate::Lua::sandbox
+    ///
     /// # Examples
     ///
     /// ```
@@ -502,12 +565,6 @@ impl fmt::Debug for Thread {
     }
 }
 
-impl PartialEq for Thread {
-    fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
-    }
-}
-
 impl LuaType for Thread {
     const TYPE_ID: c_int = ffi::LUA_TTHREAD;
 }
@@ -523,6 +580,7 @@ impl<R> AsyncThread<R> {
 #[cfg(feature = "async")]
 impl<R> Drop for AsyncThread<R> {
     fn drop(&mut self) {
+        #[allow(clippy::collapsible_if)]
         if self.recycle {
             if let Some(lua) = self.thread.0.lua.try_lock() {
                 unsafe {

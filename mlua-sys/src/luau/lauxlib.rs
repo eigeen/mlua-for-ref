@@ -3,7 +3,10 @@
 use std::os::raw::{c_char, c_float, c_int, c_void};
 use std::ptr;
 
-use super::lua::{self, lua_CFunction, lua_Number, lua_State, lua_Unsigned, LUA_REGISTRYINDEX};
+use super::lua::{self, LUA_REGISTRYINDEX, lua_CFunction, lua_Number, lua_State, lua_Unsigned};
+
+// Key, in the registry, for table of loaded modules
+pub const LUA_LOADED_TABLE: *const c_char = cstr!("_LOADED");
 
 #[repr(C)]
 pub struct luaL_Reg {
@@ -82,6 +85,9 @@ unsafe extern "C-unwind" {
 
     pub fn luaL_callyieldable(L: *mut lua_State, nargs: c_int, nresults: c_int) -> c_int;
 
+    #[link_name = "luaL_traceback"]
+    pub fn luaL_traceback_(L: *mut lua_State, L1: *mut lua_State, msg: *const c_char, level: c_int);
+
     // sandbox libraries and globals
     #[link_name = "luaL_sandbox"]
     pub fn luaL_sandbox_(L: *mut lua_State);
@@ -116,7 +122,19 @@ pub unsafe fn luaL_optstring(L: *mut lua_State, n: c_int, d: *const c_char) -> *
     luaL_optlstring(L, n, d, ptr::null_mut())
 }
 
-// TODO: luaL_opt
+#[inline(always)]
+pub unsafe fn luaL_opt<T>(
+    L: *mut lua_State,
+    f: unsafe extern "C-unwind" fn(*mut lua_State, c_int) -> T,
+    n: c_int,
+    d: T,
+) -> T {
+    if lua::lua_isnoneornil(L, n) != 0 {
+        d
+    } else {
+        f(L, n)
+    }
+}
 
 #[inline(always)]
 pub unsafe fn luaL_getmetatable(L: *mut lua_State, n: *const c_char) -> c_int {
@@ -208,4 +226,19 @@ pub unsafe fn luaL_addstring(B: *mut luaL_Strbuf, s: *const c_char) {
         len += 1;
     }
     luaL_addlstring(B, s, len);
+}
+
+pub unsafe fn luaL_addunsigned(B: *mut luaL_Strbuf, mut n: lua_Unsigned) {
+    let mut buf: [c_char; 32] = [0; 32];
+    let mut i = 32;
+    loop {
+        i -= 1;
+        let digit = (n % 10) as u8;
+        buf[i] = (b'0' + digit) as c_char;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    luaL_addlstring(B, buf.as_ptr().add(i), 32 - i);
 }

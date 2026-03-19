@@ -1,14 +1,13 @@
 use std::collections::HashMap;
 #[cfg(not(target_arch = "wasm32"))]
 use std::iter::FromIterator;
-use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::string::String as StdString;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::{error, f32, f64, fmt};
 
 use mlua::{
-    ffi, ChunkMode, Error, ExternalError, Function, Lua, LuaOptions, Nil, Result, StdLib, String, Table,
-    UserData, Value, Variadic,
+    ChunkMode, Error, ExternalError, Function, Lua, LuaOptions, Nil, Result, StdLib, Table, UserData, Value,
+    Variadic, ffi,
 };
 
 #[test]
@@ -155,7 +154,7 @@ fn test_replace_globals() -> Result<()> {
     globals.set("foo", "bar")?;
 
     lua.set_globals(globals.clone())?;
-    let val = lua.load("return foo").eval::<StdString>()?;
+    let val = lua.load("return foo").eval::<String>()?;
     assert_eq!(val, "bar");
 
     // Updating globals in sandboxed Lua state is not allowed
@@ -394,10 +393,11 @@ fn test_error() -> Result<()> {
 }
 
 #[test]
+#[cfg(not(panic = "abort"))]
 fn test_panic() -> Result<()> {
     fn make_lua(options: LuaOptions) -> Result<Lua> {
         let lua = Lua::new_with(StdLib::ALL_SAFE, options)?;
-        let rust_panic_function = lua.create_function(|_, msg: Option<StdString>| -> Result<()> {
+        let rust_panic_function = lua.create_function(|_, msg: Option<String>| -> Result<()> {
             if let Some(msg) = msg {
                 panic!("{}", msg)
             }
@@ -437,7 +437,7 @@ fn test_panic() -> Result<()> {
     {
         let lua = make_lua(LuaOptions::default())?;
         match catch_unwind(AssertUnwindSafe(|| -> Result<()> {
-            let _catched_panic = lua
+            let _caught_panic = lua
                 .load(
                     r#"
                     -- Set global
@@ -495,7 +495,7 @@ fn test_panic() -> Result<()> {
         .exec()
     }) {
         Ok(r) => panic!("no panic was detected: {:?}", r),
-        Err(p) => assert!(*p.downcast::<StdString>().unwrap() == "rust panic from lua"),
+        Err(p) => assert!(*p.downcast::<String>().unwrap() == "rust panic from lua"),
     }
 
     // Test disabling `catch_rust_panics` option / xpcall correctness
@@ -519,7 +519,7 @@ fn test_panic() -> Result<()> {
         .exec()
     }) {
         Ok(r) => panic!("no panic was detected: {:?}", r),
-        Err(p) => assert!(*p.downcast::<StdString>().unwrap() == "rust panic from lua"),
+        Err(p) => assert!(*p.downcast::<String>().unwrap() == "rust panic from lua"),
     }
 
     Ok(())
@@ -580,7 +580,7 @@ fn test_num_conversion() -> Result<()> {
 
     assert_eq!(lua.load("1.0").eval::<i64>()?, 1);
     assert_eq!(lua.load("1.0").eval::<f64>()?, 1.0);
-    #[cfg(any(feature = "lua54", feature = "lua53"))]
+    #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53"))]
     assert_eq!(lua.load("1.0").eval::<String>()?, "1.0");
     #[cfg(any(feature = "lua52", feature = "lua51", feature = "luajit", feature = "luau"))]
     assert_eq!(lua.load("1.0").eval::<String>()?, "1");
@@ -610,7 +610,7 @@ fn test_num_conversion() -> Result<()> {
     assert!(negative_zero.is_sign_negative());
 
     // In Lua <5.3 all numbers are floats
-    #[cfg(not(any(feature = "lua54", feature = "lua53", feature = "luajit")))]
+    #[cfg(not(any(feature = "lua55", feature = "lua54", feature = "lua53", feature = "luajit")))]
     {
         let negative_zero = lua.load("-0").eval::<f64>()?;
         assert_eq!(negative_zero, 0.0);
@@ -674,13 +674,21 @@ fn test_pcall_xpcall() -> Result<()> {
     assert_eq!(globals.get::<String>("pcall_error")?, "testerror");
 
     assert_eq!(globals.get::<bool>("xpcall_statusr")?, false);
-    #[cfg(any(feature = "lua54", feature = "lua53", feature = "lua52", feature = "luajit"))]
+    #[cfg(any(
+        feature = "lua55",
+        feature = "lua54",
+        feature = "lua53",
+        feature = "lua52",
+        feature = "luajit"
+    ))]
     assert_eq!(globals.get::<std::string::String>("xpcall_error")?, "testerror");
     #[cfg(feature = "lua51")]
-    assert!(globals
-        .get::<String>("xpcall_error")?
-        .to_str()?
-        .ends_with(": testerror"));
+    assert!(
+        globals
+            .get::<mlua::LuaString>("xpcall_error")?
+            .to_str()?
+            .ends_with(": testerror")
+    );
 
     // Make sure that weird xpcall error recursion at least doesn't cause unsafety or panics.
     lua.load(
@@ -897,6 +905,7 @@ fn test_registry_value_reuse() -> Result<()> {
 }
 
 #[test]
+#[cfg(not(panic = "abort"))]
 fn test_application_data() -> Result<()> {
     let lua = Lua::new();
 
@@ -1062,10 +1071,11 @@ fn test_ref_stack_exhaustion() {
         Ok(())
     })) {
         Ok(_) => panic!("no panic was detected"),
-        Err(p) => assert!(p
-            .downcast::<StdString>()
-            .unwrap()
-            .starts_with("cannot create a Lua reference, out of auxiliary stack space")),
+        Err(p) => assert!(
+            p.downcast::<String>()
+                .unwrap()
+                .starts_with("cannot create a Lua reference, out of auxiliary stack space")
+        ),
     }
 }
 
@@ -1165,7 +1175,13 @@ fn test_context_thread() -> Result<()> {
         )
         .into_function()?;
 
-    #[cfg(any(feature = "lua54", feature = "lua53", feature = "lua52", feature = "luajit52"))]
+    #[cfg(any(
+        feature = "lua55",
+        feature = "lua54",
+        feature = "lua53",
+        feature = "lua52",
+        feature = "luajit52"
+    ))]
     f.call::<()>(lua.current_thread())?;
 
     #[cfg(any(
@@ -1204,7 +1220,11 @@ fn test_context_thread_51() -> Result<()> {
 fn test_jit_version() -> Result<()> {
     let lua = Lua::new();
     let jit: Table = lua.globals().get("jit")?;
-    assert!(jit.get::<String>("version")?.to_str()?.contains("LuaJIT"));
+    assert!(
+        jit.get::<mlua::LuaString>("version")?
+            .to_str()?
+            .contains("LuaJIT")
+    );
     Ok(())
 }
 
@@ -1304,7 +1324,7 @@ fn test_inspect_stack() -> Result<()> {
     // Not inside any function
     assert!(lua.inspect_stack(0, |_| ()).is_none());
 
-    let logline = lua.create_function(|lua, msg: StdString| {
+    let logline = lua.create_function(|lua, msg: String| {
         let r = lua
             .inspect_stack(1, |debug| {
                 let source = debug.source().short_src;
@@ -1341,14 +1361,20 @@ fn test_inspect_stack() -> Result<()> {
     })?;
     lua.globals().set("stack_info", stack_info)?;
 
-    #[cfg(any(feature = "lua54", feature = "lua53", feature = "lua52", feature = "luau"))]
+    #[cfg(any(
+        feature = "lua55",
+        feature = "lua54",
+        feature = "lua53",
+        feature = "lua52",
+        feature = "luau"
+    ))]
     lua.load(
         r#"
         local stack_info = stack_info
         local function baz(a, b, c, ...)
             return stack_info()
         end
-        assert(baz() == 'DebugStack { num_ups: 1, num_params: 3, is_vararg: true }')
+        assert(baz() == 'DebugStack { num_upvalues: 1, num_params: 3, is_vararg: true }')
     "#,
     )
     .exec()?;
@@ -1361,7 +1387,7 @@ fn test_inspect_stack() -> Result<()> {
         local function baz(a, b, c, ...)
             return stack_info()
         end
-        assert(baz() == 'DebugStack { num_ups: 1 }')
+        assert(baz() == 'DebugStack { num_upvalues: 1 }')
     "#,
     )
     .exec()?;
@@ -1389,6 +1415,79 @@ fn test_inspect_stack() -> Result<()> {
 }
 
 #[test]
+fn test_traceback() -> Result<()> {
+    let lua = Lua::new();
+
+    // Test traceback at level 0 (not inside any function)
+    let traceback = lua.traceback(None, 0)?.to_string_lossy();
+    assert!(traceback.contains("stack traceback:"));
+
+    // Test traceback with a message prefix
+    let traceback = lua.traceback(Some("error occurred"), 0)?.to_string_lossy();
+    assert!(traceback.starts_with("error occurred"));
+    assert!(traceback.contains("stack traceback:"));
+
+    // Test traceback inside a function
+    let get_traceback = lua
+        .create_function(|lua, (msg, level): (Option<String>, usize)| lua.traceback(msg.as_deref(), level))?;
+    lua.globals().set("get_traceback", get_traceback)?;
+
+    lua.load(
+        r#"
+        local function foo()
+            -- Level 1 is inside foo (the caller)
+            local traceback = get_traceback(nil, 1)
+            return traceback
+        end
+        local function bar()
+            local result = foo()
+            return result
+        end
+        local function baz()
+            local result = bar()
+            return result
+        end
+
+        local traceback = baz()
+        assert(traceback:match("in %a+ 'foo'"))
+        assert(traceback:match("in %a+ 'bar'"))
+        assert(traceback:match("in %a+ 'baz'"))
+    "#,
+    )
+    .exec()?;
+
+    // Test traceback at different levels
+    lua.load(
+        r#"
+        local function foo()
+            local tb0 = get_traceback(nil, 0)
+            local tb1 = get_traceback(nil, 1)
+            local tb2 = get_traceback(nil, 2)
+            return tb0, tb1, tb2
+        end
+        local function bar()
+            local tb0, tb1, tb2 = foo()
+            return tb0, tb1, tb2
+        end
+
+        local tb0, tb1, tb2 = bar()
+
+        assert(tb0:match("in %a+ 'get_traceback'"))
+        assert(tb0:match("in %a+ 'foo'"))
+
+        assert(not tb1:match("in %a+ 'get_traceback'"))
+        assert(tb1:match("in %a+ 'foo'"))
+
+        assert(not tb2:match("in %a+ 'foo'"))
+        assert(tb1:match("in %a+ 'bar'"))
+    "#,
+    )
+    .exec()?;
+
+    Ok(())
+}
+
+#[test]
 fn test_multi_states() -> Result<()> {
     let lua = Lua::new();
 
@@ -1407,13 +1506,13 @@ fn test_multi_states() -> Result<()> {
 }
 
 #[test]
-#[cfg(feature = "lua54")]
+#[cfg(any(feature = "lua55", feature = "lua54"))]
 fn test_warnings() -> Result<()> {
     let lua = Lua::new();
-    lua.set_app_data::<Vec<(StdString, bool)>>(Vec::new());
+    lua.set_app_data::<Vec<(String, bool)>>(Vec::new());
 
     lua.set_warning_function(|lua, msg, incomplete| {
-        lua.app_data_mut::<Vec<(StdString, bool)>>()
+        lua.app_data_mut::<Vec<(String, bool)>>()
             .unwrap()
             .push((msg.to_string(), incomplete));
         Ok(())
@@ -1427,7 +1526,7 @@ fn test_warnings() -> Result<()> {
     lua.remove_warning_function();
     lua.warning("one more warning", false);
 
-    let messages = lua.app_data_ref::<Vec<(StdString, bool)>>().unwrap();
+    let messages = lua.app_data_ref::<Vec<(String, bool)>>().unwrap();
     assert_eq!(
         *messages,
         vec![
