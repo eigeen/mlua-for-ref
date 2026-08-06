@@ -1,8 +1,11 @@
 //! Lua debugging interface.
 //!
 //! This module provides access to the Lua debug interface, allowing inspection of the call stack,
-//! and function information. The main types are [`struct@Debug`] for accessing debug information
-//! and [`HookTriggers`] for configuring debug hooks.
+//! and function information. The main type is [`struct@Debug`] for accessing debug information.
+#![cfg_attr(
+    not(feature = "luau"),
+    doc = "\nDebug hooks are configured with [`HookTriggers`]."
+)]
 
 use std::borrow::Cow;
 use std::os::raw::c_int;
@@ -99,10 +102,7 @@ impl<'a> Debug<'a> {
             DebugNames {
                 name: ptr_to_lossy_str((*self.ar).name),
                 #[cfg(not(feature = "luau"))]
-                name_what: match ptr_to_str((*self.ar).namewhat) {
-                    Some("") => None,
-                    val => val,
-                },
+                name_what: ptr_to_str((*self.ar).namewhat).filter(|s| !s.is_empty()),
                 #[cfg(feature = "luau")]
                 name_what: None,
             }
@@ -312,6 +312,7 @@ impl HookTriggers {
     /// Returns an instance of `HookTriggers` with [`on_calls`] trigger set.
     ///
     /// [`on_calls`]: #structfield.on_calls
+    #[must_use]
     pub const fn on_calls(mut self) -> Self {
         self.on_calls = true;
         self
@@ -320,6 +321,7 @@ impl HookTriggers {
     /// Returns an instance of `HookTriggers` with [`on_returns`] trigger set.
     ///
     /// [`on_returns`]: #structfield.on_returns
+    #[must_use]
     pub const fn on_returns(mut self) -> Self {
         self.on_returns = true;
         self
@@ -328,6 +330,7 @@ impl HookTriggers {
     /// Returns an instance of `HookTriggers` with [`every_line`] trigger set.
     ///
     /// [`every_line`]: #structfield.every_line
+    #[must_use]
     pub const fn every_line(mut self) -> Self {
         self.every_line = true;
         self
@@ -336,6 +339,7 @@ impl HookTriggers {
     /// Returns an instance of `HookTriggers` with [`every_nth_instruction`] trigger set.
     ///
     /// [`every_nth_instruction`]: #structfield.every_nth_instruction
+    #[must_use]
     pub const fn every_nth_instruction(mut self, n: u32) -> Self {
         self.every_nth_instruction = Some(n);
         self
@@ -379,9 +383,7 @@ impl std::ops::BitOr for HookTriggers {
         self.on_calls |= rhs.on_calls;
         self.on_returns |= rhs.on_returns;
         self.every_line |= rhs.every_line;
-        if self.every_nth_instruction.is_none() && rhs.every_nth_instruction.is_some() {
-            self.every_nth_instruction = rhs.every_nth_instruction;
-        }
+        self.every_nth_instruction = self.every_nth_instruction.or(rhs.every_nth_instruction);
         self
     }
 }

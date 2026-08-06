@@ -1,5 +1,9 @@
 cfg_if::cfg_if! {
-    if #[cfg(all(feature = "lua55", not(any(feature = "lua54", feature = "lua53", feature = "lua52", feature = "lua51", feature = "luajit", feature = "luau"))))] {
+    if #[cfg(all(feature = "lua55", feature = "vendored"))] {
+        fn main() {
+            compile_error!("`lua55` + `vendored` is unavailable in mlua-for-ref because vendored Lua is locked to REFramework's Lua 5.4.3; use external/module mode for Lua 5.5");
+        }
+    } else if #[cfg(all(feature = "lua55", not(any(feature = "lua54", feature = "lua53", feature = "lua52", feature = "lua51", feature = "luajit", feature = "luau"))))] {
         include!("main_inner.rs");
     } else if #[cfg(all(feature = "lua54", not(any(feature = "lua55", feature = "lua53", feature = "lua52", feature = "lua51", feature = "luajit", feature = "luau"))))] {
         include!("main_inner.rs");
@@ -13,6 +17,10 @@ cfg_if::cfg_if! {
         include!("main_inner.rs");
     } else if #[cfg(all(feature = "luau", not(any(feature = "lua55", feature = "lua54", feature = "lua53", feature = "lua52", feature = "lua51", feature = "luajit"))))] {
         include!("main_inner.rs");
+    } else if #[cfg(not(any(feature = "lua55", feature = "lua54", feature = "lua53", feature = "lua52", feature = "lua51", feature = "luajit", feature = "luau")))] {
+        fn main() {
+            compile_error!("No Lua feature enabled. Please enable one of: lua55, lua54, lua53, lua52, lua51, luajit, luajit52, luau");
+        }
     } else {
         fn main() {
             compile_error!("You can enable only one of the features: lua55, lua54, lua53, lua52, lua51, luajit, luajit52, luau");

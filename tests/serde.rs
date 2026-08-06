@@ -4,9 +4,9 @@ use std::collections::HashMap;
 use std::error::Error as StdError;
 
 use bstr::BString;
+use mlua::serde::{DeserializeOptions, SerializeOptions};
 use mlua::{
-    AnyUserData, DeserializeOptions, Error, ExternalResult, IntoLua, Lua, LuaSerdeExt, Result as LuaResult,
-    SerializeOptions, UserData, Value,
+    AnyUserData, Error, ExternalResult, IntoLua, Lua, LuaSerdeExt, Result as LuaResult, UserData, Value,
 };
 use serde::{Deserialize, Serialize};
 
@@ -304,6 +304,12 @@ fn test_serialize_mixed_table() -> LuaResult<()> {
     let table = lua.load(r#"{1,2,3, ["1"]="value"}"#).eval::<Value>()?;
     let json = serde_json::to_string(&table.to_serializable().detect_mixed_tables(true)).unwrap();
     assert_eq!(json, r#"{"1":1,"2":2,"3":3,"1":"value"}"#);
+
+    // Array metatable takes precedence
+    let table = lua.load(r#"{1,2,3, key="value"}"#).eval::<Value>()?;
+    (table.as_table().unwrap()).set_metatable(Some(lua.array_metatable()))?;
+    let json = serde_json::to_string(&table.to_serializable().detect_mixed_tables(true)).unwrap();
+    assert_eq!(json, r#"[1,2,3]"#);
 
     Ok(())
 }

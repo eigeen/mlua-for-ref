@@ -130,6 +130,45 @@ fn test_gc_control() -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(feature = "lua54", feature = "lua55"))]
+#[test]
+fn test_gc_set_mode_in_finalizer() -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let lua = Lua::new();
+
+    // While finalizers are running, the GC is internally stopped and `lua_gc` rejects all
+    // options
+    let called = Arc::new(AtomicBool::new(false));
+    let called2 = called.clone();
+    let returned_requested_mode = Arc::new(AtomicBool::new(false));
+    let returned_requested_mode2 = returned_requested_mode.clone();
+    let finalizer = lua.create_function(move |lua, ()| {
+        let mode = lua.gc_set_mode(GcMode::Generational(GcGenParams::default()));
+        called2.store(true, Ordering::Relaxed);
+        returned_requested_mode2.store(matches!(mode, GcMode::Generational(_)), Ordering::Relaxed);
+        Ok(())
+    })?;
+    lua.globals().set("finalizer", finalizer)?;
+    lua.load("setmetatable({}, { __gc = finalizer })").exec()?;
+    lua.globals().raw_remove("finalizer")?;
+
+    lua.gc_collect()?;
+    lua.gc_collect()?;
+    assert!(called.load(Ordering::Relaxed), "finalizer did not run");
+
+    // Lua 5.4.3 predates the internal-GC-stop return convention used by newer
+    // patch releases. The call must remain safe, but its returned previous mode
+    // cannot be normalized without inspecting Lua's private global_State.
+    #[cfg(not(all(feature = "lua54", feature = "vendored")))]
+    assert!(
+        returned_requested_mode.load(Ordering::Relaxed),
+        "gc_set_mode did not report the rejected mode change"
+    );
+
+    Ok(())
+}
+
 #[cfg(any(feature = "lua53", feature = "lua52"))]
 #[test]
 fn test_gc_error() {

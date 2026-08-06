@@ -143,6 +143,38 @@ fn test_table_insert_remove() -> Result<()> {
 }
 
 #[test]
+fn test_table_remove_metatable() -> Result<()> {
+    let lua = Lua::new();
+
+    let inner = lua.create_sequence_from([1, 2, 3, 4, 5])?;
+    let mt = lua.create_table()?;
+    mt.set("__index", &inner)?;
+    mt.set("__newindex", &inner)?;
+    mt.set("__len", {
+        let inner = inner.clone();
+        lua.create_function(move |_, ()| Ok(inner.raw_len()))?
+    })?;
+
+    let t = lua.create_table()?;
+    t.set_metatable(Some(mt))?;
+
+    t.remove(2)?; // removes value `2`
+    assert_eq!(t.len()?, 4);
+    assert_eq!(
+        inner.pairs().collect::<Result<Vec<(i64, i64)>>>()?,
+        vec![(1, 1), (2, 3), (3, 4), (4, 5)]
+    );
+
+    // Remove non-integer key
+    t.set("abc", "abcdef")?;
+    assert_eq!(inner.get::<String>("abc")?, "abcdef");
+    t.remove("abc")?;
+    assert_eq!(inner.get::<Value>("abc")?, Value::Nil);
+
+    Ok(())
+}
+
+#[test]
 fn test_table_clear() -> Result<()> {
     let lua = Lua::new();
 

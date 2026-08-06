@@ -3,12 +3,6 @@
 //! Tables are Lua's primary data structure, used for arrays, dictionaries, objects, modules,
 //! and more. This module provides types for creating and manipulating Lua tables from Rust.
 //!
-//! # Main Types
-//!
-//! - [`Table`] - A handle to a Lua table.
-//! - [`TablePairs`] - An iterator over key-value pairs in a table.
-//! - [`TableSequence`] - An iterator over the array (sequence) portion of a table.
-//!
 //! # Basic Operations
 //!
 //! Tables support key-value access similar to Rust's `HashMap`:
@@ -347,6 +341,54 @@ impl Table {
         }
     }
 
+    /// Removes a key from the table.
+    ///
+    /// If `key` is an integer, mlua shifts down the elements from `table[key+1]`,
+    /// and erases element `table[key]`. The complexity is `O(n)` in the worst case,
+    /// where `n` is the table length.
+    ///
+    /// For other key types this is equivalent to setting `table[key] = nil`.
+    ///
+    /// This might invoke the `__len`, `__index` and `__newindex` metamethods.
+    /// Use the [`raw_remove`] method if that is not desired.
+    ///
+    /// [`raw_remove`]: Table::raw_remove
+    pub fn remove(&self, key: impl IntoLua) -> Result<()> {
+        // Fast track (skip protected call)
+        if !self.has_metatable() {
+            return self.raw_remove(key);
+        }
+
+        let lua = self.0.lua.lock();
+        let key = key.into_lua(lua.lua())?;
+        match key {
+            Value::Integer(idx) => {
+                let size = self.len()?;
+                if idx < 1 || idx > size {
+                    return Err(Error::runtime("index out of bounds"));
+                }
+
+                let state = lua.state();
+                unsafe {
+                    let _sg = StackGuard::new(state);
+                    check_stack(state, 4)?;
+
+                    lua.push_ref(&self.0);
+                    protect_lua!(state, 1, 0, |state| {
+                        for i in idx..size {
+                            // table[i] = table[i+1]
+                            ffi::lua_geti(state, -1, i + 1);
+                            ffi::lua_seti(state, -2, i);
+                        }
+                        ffi::lua_pushnil(state);
+                        ffi::lua_seti(state, -2, size);
+                    })
+                }
+            }
+            _ => self.set(key, Nil),
+        }
+    }
+
     /// Compares two tables for equality.
     ///
     /// Tables are compared by reference first.
@@ -570,6 +612,7 @@ impl Table {
             #[cfg(not(feature = "luau"))]
             {
                 let state = lua.state();
+                let _sg = StackGuard::new(state);
                 check_stack(state, 4)?;
 
                 lua.push_ref(&self.0);
@@ -784,10 +827,8 @@ impl Table {
             ffi::lua_pushnil(state);
             while ffi::lua_next(state, -2) != 0 {
                 let k = K::from_stack(-2, &lua)?;
-                let v = V::from_stack(-1, &lua)?;
+                let v = lua.pop::<V>()?;
                 f(k, v)?;
-                // Keep key for next iteration
-                ffi::lua_pop(state, 1);
             }
         }
         Ok(())
@@ -860,8 +901,7 @@ impl Table {
                 if len.is_none() && t == ffi::LUA_TNIL {
                     break;
                 }
-                f(V::from_stack(-1, &lua)?)?;
-                ffi::lua_pop(state, 1);
+                f(lua.pop::<V>()?)?;
             }
         }
         Ok(())
@@ -944,17 +984,22 @@ impl Table {
     /// Determines if the table should be encoded as an array or a map.
     ///
     /// The algorithm is the following:
-    /// 1. If `detect_mixed_tables` is enabled, iterate over all keys in the table checking is they
+    /// 1. If the table has the array metatable attached, always encode it as an array.
+    ///
+    /// 2. If `detect_mixed_tables` is enabled, iterate over all keys in the table checking is they
     ///    all are positive integers. If non-array key is found, return `None` (encode as map).
     ///    Otherwise check the sparsity of the array. Too sparse arrays are encoded as maps.
     ///
-    /// 2. If `detect_mixed_tables` is disabled, check if the table has a positive length or has the
-    ///    array metatable. If so, encode as array. If the table is empty and
-    ///    `encode_empty_tables_as_array` is enabled, encode as array.
+    /// 3. If `detect_mixed_tables` is disabled, check if the table has a positive length. If so,
+    ///    encode as array. If the table is empty and `encode_empty_tables_as_array` is enabled,
+    ///    encode as array.
     ///
     /// Returns the length of the array if it should be encoded as an array.
     #[cfg(feature = "serde")]
     pub(crate) fn encode_as_array(&self, options: crate::serde::de::Options) -> Option<usize> {
+        if self.has_array_metatable() {
+            return Some(self.raw_len());
+        }
         if options.detect_mixed_tables {
             if let Some((len, max_idx)) = self.find_array_len() {
                 // If the array is too sparse, serialize it as a map instead
@@ -964,7 +1009,7 @@ impl Table {
             }
         } else {
             let len = self.raw_len();
-            if len > 0 || self.has_array_metatable() {
+            if len > 0 {
                 return Some(len);
             }
             if options.encode_empty_tables_as_array && self.is_empty() {

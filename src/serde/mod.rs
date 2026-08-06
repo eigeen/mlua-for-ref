@@ -37,8 +37,8 @@ pub trait LuaSerdeExt: Sealed {
     fn null(&self) -> Value;
 
     /// A metatable attachable to a Lua table to systematically encode it as Array (instead of Map).
-    /// As result, encoded Array will contain only sequence part of the table, with the same length
-    /// as the `#` operator on that table.
+    /// As a result, encoded Array will contain only sequence part of the table, with the same
+    /// length as the `#` operator on that table.
     ///
     /// # Example
     ///
@@ -101,7 +101,8 @@ pub trait LuaSerdeExt: Sealed {
     /// # Example
     ///
     /// ```
-    /// use mlua::{Lua, Result, LuaSerdeExt, SerializeOptions};
+    /// use mlua::serde::SerializeOptions;
+    /// use mlua::{Lua, Result, LuaSerdeExt};
     ///
     /// fn main() -> Result<()> {
     ///     let lua = Lua::new();
@@ -151,7 +152,8 @@ pub trait LuaSerdeExt: Sealed {
     /// # Example
     ///
     /// ```
-    /// use mlua::{Lua, Result, LuaSerdeExt, DeserializeOptions};
+    /// use mlua::serde::DeserializeOptions;
+    /// use mlua::{Lua, Result, LuaSerdeExt};
     /// use serde::Deserialize;
     ///
     /// #[derive(Deserialize, Debug, PartialEq)]
@@ -242,7 +244,5 @@ static ARRAY_METATABLE_REGISTRY_KEY: u8 = 0;
 pub mod de;
 pub mod ser;
 
-#[doc(inline)]
-pub use de::Deserializer;
-#[doc(inline)]
-pub use ser::Serializer;
+pub use de::{Deserializer, Options as DeserializeOptions};
+pub use ser::{Options as SerializeOptions, Serializer};

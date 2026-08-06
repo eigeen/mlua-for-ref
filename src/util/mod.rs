@@ -117,14 +117,10 @@ pub(crate) unsafe fn push_external_string(
     }
 
     if protect {
-        let res = protect_lua!(state, 0, 1, move |state| {
+        // Lua free external string on error
+        protect_lua!(state, 0, 1, move |state| {
             ffi::lua_pushexternalstring(state, s_ptr, s_len, Some(dealloc), bytes_ud as *mut _);
-        });
-        if res.is_err() {
-            // Deallocate on error
-            drop(Box::from_raw(bytes_ud));
-            return res;
-        }
+        })?;
     } else {
         ffi::lua_pushexternalstring(state, s_ptr, s_len, Some(dealloc), bytes_ud as *mut _);
     }
@@ -282,7 +278,7 @@ pub(crate) unsafe fn to_string(state: *mut ffi::lua_State, index: c_int) -> Stri
         }
         ffi::LUA_TNUMBER => {
             let mut isint = 0;
-            let i = ffi::lua_tointegerx(state, -1, &mut isint);
+            let i = ffi::lua_tointegerx(state, index, &mut isint);
             if isint == 0 {
                 ffi::lua_tonumber(state, index).to_string()
             } else {
@@ -349,10 +345,7 @@ pub(crate) unsafe fn ptr_to_lossy_str<'a>(input: *const c_char) -> Option<Cow<'a
 }
 
 pub(crate) fn linenumber_to_usize(n: c_int) -> Option<usize> {
-    match n {
-        n if n < 0 => None,
-        n => Some(n as usize),
-    }
+    usize::try_from(n).ok()
 }
 
 mod error;

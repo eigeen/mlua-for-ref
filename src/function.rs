@@ -3,12 +3,6 @@
 //! This module provides types for working with Lua functions from Rust, including
 //! both Lua-defined functions and native Rust callbacks.
 //!
-//! # Main Types
-//!
-//! - [`Function`] - A handle to a Lua function that can be called from Rust.
-//! - [`FunctionInfo`] - Debug information about a function (name, source, line numbers, etc.).
-//! - [`CoverageInfo`] - Code coverage data for Luau functions (requires `luau` feature).
-//!
 //! # Calling Functions
 //!
 //! Use [`Function::call`] to invoke a Lua function synchronously:
@@ -81,12 +75,13 @@
 
 use std::cell::RefCell;
 use std::os::raw::{c_int, c_void};
+use std::result::Result as StdResult;
 use std::{mem, ptr, slice};
 
-use crate::error::{Error, Result};
+use crate::error::{Error, ExternalError, ExternalResult, Result};
 use crate::state::Lua;
 use crate::table::Table;
-use crate::traits::{FromLuaMulti, IntoLua, IntoLuaMulti, LuaNativeFn, LuaNativeFnMut};
+use crate::traits::{FromLuaMulti, IntoLua, IntoLuaMulti};
 use crate::types::{Callback, LuaType, MaybeSend, ValueRef};
 use crate::util::{
     StackGuard, assert_stack, check_stack, linenumber_to_usize, pop_error, ptr_to_lossy_str, ptr_to_str,
@@ -96,7 +91,6 @@ use crate::value::Value;
 #[cfg(feature = "async")]
 use {
     crate::thread::AsyncThread,
-    crate::traits::LuaNativeAsyncFn,
     crate::types::AsyncCallback,
     std::future::{self, Future},
     std::pin::{Pin, pin},
@@ -258,6 +252,7 @@ impl Function {
             lua.create_recycled_thread(self).and_then(|th| {
                 let mut th = th.into_async(args)?;
                 th.set_recyclable(true);
+                lua.update_thread_ownership(th.thread(), Some(lua.state()));
                 Ok(th)
             })
         })
@@ -462,10 +457,7 @@ impl Function {
             FunctionInfo {
                 name: ptr_to_lossy_str(ar.name).map(|s| s.into_owned()),
                 #[cfg(not(feature = "luau"))]
-                name_what: match ptr_to_str(ar.namewhat) {
-                    Some("") => None,
-                    val => val,
-                },
+                name_what: ptr_to_str(ar.namewhat).filter(|s| !s.is_empty()),
                 #[cfg(feature = "luau")]
                 name_what: None,
                 what: ptr_to_str(ar.what).unwrap_or("main"),
@@ -547,22 +539,15 @@ impl Function {
     where
         F: FnMut(CoverageInfo),
     {
-        use std::ffi::CStr;
-        use std::os::raw::c_char;
-
         unsafe extern "C-unwind" fn callback<F: FnMut(CoverageInfo)>(
             data: *mut c_void,
-            function: *const c_char,
+            function: *const std::os::raw::c_char,
             line_defined: c_int,
             depth: c_int,
             hits: *const c_int,
             size: usize,
         ) {
-            let function = if !function.is_null() {
-                Some(CStr::from_ptr(function).to_string_lossy().to_string())
-            } else {
-                None
-            };
+            let function = ptr_to_lossy_str(function).map(|s| s.into_owned());
             let rust_callback = &*(data as *const RefCell<F>);
             if let Ok(mut rust_callback) = rust_callback.try_borrow_mut() {
                 // Call the Rust callback with CoverageInfo
@@ -633,33 +618,35 @@ struct WrappedFunction(pub(crate) Callback);
 struct WrappedAsyncFunction(pub(crate) AsyncCallback);
 
 impl Function {
-    /// Wraps a Rust function or closure, returning an opaque type that implements [`IntoLua`]
+    /// Wraps a Rust function or closure, returning an opaque type that implements the [`IntoLua`]
     /// trait.
     #[inline]
-    pub fn wrap<F, A, R>(func: F) -> impl IntoLua
+    pub fn wrap<F, A, R, E>(func: F) -> impl IntoLua
     where
-        F: LuaNativeFn<A, Output = Result<R>> + MaybeSend + 'static,
+        F: LuaNativeFn<A, Output = StdResult<R, E>> + MaybeSend + 'static,
         A: FromLuaMulti,
         R: IntoLuaMulti,
+        E: ExternalError,
     {
         WrappedFunction(Box::new(move |lua, nargs| unsafe {
             let args = A::from_stack_args(nargs, 1, None, lua)?;
-            func.call(args)?.push_into_stack_multi(lua)
+            func.call(args).into_lua_err()?.push_into_stack_multi(lua)
         }))
     }
 
     /// Wraps a Rust mutable closure, returning an opaque type that implements [`IntoLua`] trait.
-    pub fn wrap_mut<F, A, R>(func: F) -> impl IntoLua
+    pub fn wrap_mut<F, A, R, E>(func: F) -> impl IntoLua
     where
-        F: LuaNativeFnMut<A, Output = Result<R>> + MaybeSend + 'static,
+        F: LuaNativeFnMut<A, Output = StdResult<R, E>> + MaybeSend + 'static,
         A: FromLuaMulti,
         R: IntoLuaMulti,
+        E: ExternalError,
     {
         let func = RefCell::new(func);
         WrappedFunction(Box::new(move |lua, nargs| unsafe {
             let mut func = func.try_borrow_mut().map_err(|_| Error::RecursiveMutCallback)?;
             let args = A::from_stack_args(nargs, 1, None, lua)?;
-            func.call(args)?.push_into_stack_multi(lua)
+            func.call(args).into_lua_err()?.push_into_stack_multi(lua)
         }))
     }
 
@@ -672,6 +659,7 @@ impl Function {
     pub fn wrap_raw<F, A>(func: F) -> impl IntoLua
     where
         F: LuaNativeFn<A> + MaybeSend + 'static,
+        F::Output: IntoLuaMulti,
         A: FromLuaMulti,
     {
         WrappedFunction(Box::new(move |lua, nargs| unsafe {
@@ -688,6 +676,7 @@ impl Function {
     pub fn wrap_raw_mut<F, A>(func: F) -> impl IntoLua
     where
         F: LuaNativeFnMut<A> + MaybeSend + 'static,
+        F::Output: IntoLuaMulti,
         A: FromLuaMulti,
     {
         let func = RefCell::new(func);
@@ -702,11 +691,12 @@ impl Function {
     /// trait.
     #[cfg(feature = "async")]
     #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
-    pub fn wrap_async<F, A, R>(func: F) -> impl IntoLua
+    pub fn wrap_async<F, A, R, E>(func: F) -> impl IntoLua
     where
-        F: LuaNativeAsyncFn<A, Output = Result<R>> + MaybeSend + 'static,
+        F: LuaNativeAsyncFn<A, Output = StdResult<R, E>> + MaybeSend + 'static,
         A: FromLuaMulti,
         R: IntoLuaMulti,
+        E: ExternalError,
     {
         WrappedAsyncFunction(Box::new(move |rawlua, nargs| unsafe {
             let args = match A::from_stack_args(nargs, 1, None, rawlua) {
@@ -715,7 +705,7 @@ impl Function {
             };
             let lua = rawlua.lua();
             let fut = func.call(args);
-            Box::pin(async move { fut.await?.push_into_stack_multi(lua.raw_lua()) })
+            Box::pin(async move { fut.await.into_lua_err()?.push_into_stack_multi(lua.raw_lua()) })
         }))
     }
 
@@ -729,6 +719,7 @@ impl Function {
     pub fn wrap_raw_async<F, A>(func: F) -> impl IntoLua
     where
         F: LuaNativeAsyncFn<A> + MaybeSend + 'static,
+        F::Output: IntoLuaMulti,
         A: FromLuaMulti,
     {
         WrappedAsyncFunction(Box::new(move |rawlua, nargs| unsafe {
@@ -787,6 +778,95 @@ impl<R: FromLuaMulti> Future for AsyncCallFuture<R> {
         }
     }
 }
+
+/// A trait for types that can be used as Lua functions.
+pub trait LuaNativeFn<A: FromLuaMulti> {
+    type Output;
+
+    fn call(&self, args: A) -> Self::Output;
+}
+
+/// A trait for types with mutable state that can be used as Lua functions.
+pub trait LuaNativeFnMut<A: FromLuaMulti> {
+    type Output;
+
+    fn call(&mut self, args: A) -> Self::Output;
+}
+
+/// A trait for types that returns a future and can be used as Lua functions.
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub trait LuaNativeAsyncFn<A: FromLuaMulti> {
+    type Output;
+
+    fn call(&self, args: A) -> impl Future<Output = Self::Output> + MaybeSend + 'static;
+}
+
+macro_rules! impl_lua_native_fn {
+    ($($A:ident),*) => {
+        impl<FN, $($A,)* R> LuaNativeFn<($($A,)*)> for FN
+        where
+            FN: Fn($($A,)*) -> R + MaybeSend + 'static,
+            ($($A,)*): FromLuaMulti,
+        {
+            type Output = R;
+
+            #[allow(non_snake_case)]
+            fn call(&self, args: ($($A,)*)) -> Self::Output {
+                let ($($A,)*) = args;
+                self($($A,)*)
+            }
+        }
+
+        impl<FN, $($A,)* R> LuaNativeFnMut<($($A,)*)> for FN
+        where
+            FN: FnMut($($A,)*) -> R + MaybeSend + 'static,
+            ($($A,)*): FromLuaMulti,
+        {
+            type Output = R;
+
+            #[allow(non_snake_case)]
+            fn call(&mut self, args: ($($A,)*)) -> Self::Output {
+                let ($($A,)*) = args;
+                self($($A,)*)
+            }
+        }
+
+        #[cfg(feature = "async")]
+        impl<FN, $($A,)* Fut, R> LuaNativeAsyncFn<($($A,)*)> for FN
+        where
+            FN: Fn($($A,)*) -> Fut + MaybeSend + 'static,
+            ($($A,)*): FromLuaMulti,
+            Fut: Future<Output = R> + MaybeSend + 'static,
+        {
+            type Output = R;
+
+            #[allow(non_snake_case)]
+            fn call(&self, args: ($($A,)*)) -> impl Future<Output = Self::Output> + MaybeSend + 'static {
+                let ($($A,)*) = args;
+                self($($A,)*)
+            }
+        }
+    };
+}
+
+impl_lua_native_fn!();
+impl_lua_native_fn!(A);
+impl_lua_native_fn!(A, B);
+impl_lua_native_fn!(A, B, C);
+impl_lua_native_fn!(A, B, C, D);
+impl_lua_native_fn!(A, B, C, D, E);
+impl_lua_native_fn!(A, B, C, D, E, F);
+impl_lua_native_fn!(A, B, C, D, E, F, G);
+impl_lua_native_fn!(A, B, C, D, E, F, G, H);
+impl_lua_native_fn!(A, B, C, D, E, F, G, H, I);
+impl_lua_native_fn!(A, B, C, D, E, F, G, H, I, J);
+impl_lua_native_fn!(A, B, C, D, E, F, G, H, I, J, K);
+impl_lua_native_fn!(A, B, C, D, E, F, G, H, I, J, K, L);
+impl_lua_native_fn!(A, B, C, D, E, F, G, H, I, J, K, L, M);
+impl_lua_native_fn!(A, B, C, D, E, F, G, H, I, J, K, L, M, N);
+impl_lua_native_fn!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O);
+impl_lua_native_fn!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P);
 
 #[cfg(test)]
 mod assertions {

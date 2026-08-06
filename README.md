@@ -1,4 +1,9 @@
 # mlua
+
+> **REFramework fork:** the `reframework` branch tracks upstream `mlua` while
+> pinning vendored Lua 5.4 to exactly 5.4.3 for ABI compatibility with
+> REFramework. `lua55` remains available with external/module linking, but the
+> `lua55,vendored` combination is intentionally unsupported.
 [![Build Status]][github-actions] [![Latest Version]][crates.io] [![API Documentation]][docs.rs] [![Coverage Status]][codecov.io] ![MSRV]
 
 [Build Status]: https://github.com/mlua-rs/mlua/workflows/CI/badge.svg
@@ -9,15 +14,13 @@
 [docs.rs]: https://docs.rs/mlua
 [Coverage Status]: https://codecov.io/gh/mlua-rs/mlua/branch/main/graph/badge.svg?token=99339FS1CG
 [codecov.io]: https://codecov.io/gh/mlua-rs/mlua
-[MSRV]: https://img.shields.io/badge/rust-1.79+-brightgreen.svg?&logo=rust
+[MSRV]: https://img.shields.io/badge/rust-1.88+-brightgreen.svg?&logo=rust
 
 [Guided Tour] | [Benchmarks] | [FAQ]
 
 [Guided Tour]: examples/guided_tour.rs
 [Benchmarks]: https://github.com/khvzak/script-bench-rs
 [FAQ]: FAQ.md
-
-## The main branch is the development version of `mlua`. Please see the [v0.11](https://github.com/mlua-rs/mlua/tree/v0.11) branch for the stable versions of `mlua`.
 
 `mlua` is a set of bindings to the [Lua](https://www.lua.org) programming language for Rust with a goal of providing a
 _safe_ (as much as possible), high level, easy to use, practical and flexible API.
@@ -48,11 +51,11 @@ Below is a list of the available feature flags. By default `mlua` does not enabl
 * `luau`: enable [Luau] support (auto vendored mode)
 * `luau-jit`: enable [Luau] support with JIT backend.
 * `luau-vector4`: enable [Luau] support with 4-dimensional vector.
-* `vendored`: build static Lua(JIT) libraries from sources during `mlua` compilation using [lua-src] or [luajit-src]
+* `vendored`: build static Lua(JIT) libraries from sources during `mlua` compilation using [lua-src] or [luajit-src]; this fork pins Lua to 5.4.3 and rejects `lua55,vendored`
 * `module`: enable module mode (building loadable `cdylib` library for Lua)
 * `async`: enable async/await support (any executor can be used, eg. [tokio] or [async-std])
-* `send`: make `mlua::Lua: Send + Sync` (adds [`Send`] requirement to `mlua::Function` and `mlua::UserData`)
-* `error-send`: make `mlua:Error: Send + Sync`
+* `send`: make `mlua::Lua: Send + Sync` (adds [`Send`] requirement to `mlua::Function` and `Send + Sync` to `mlua::UserData`)
+* `error-send`: make `mlua::Error: Send + Sync`
 * `serde`: add serialization and deserialization support to `mlua` types using [serde]
 * `macros`: enable procedural macros (such as `chunk!`)
 * `anyhow`: enable `anyhow::Error` conversion into Lua
@@ -127,13 +130,13 @@ my_project $ LUA_LIB=$HOME/tmp/lua-5.2.4/src LUA_LIB_NAME=lua LUA_LINK=static ca
 Just enable the `vendored` feature and cargo will automatically build and link the specified Lua/LuaJIT version. This is the easiest way to get started with `mlua`.
 
 ### Standalone mode
-In standalone mode, `mlua` allows adding scripting support to your application with a gently configured Lua runtime to ensure safety and soundness.
+In standalone mode, `mlua` allows adding scripting support to your application with a properly configured Lua runtime to ensure safety and soundness.
 
 Add to `Cargo.toml`:
 
 ``` toml
 [dependencies]
-mlua = { version = "0.11", features = ["lua54", "vendored"] }
+mlua = { version = "0.12", features = ["lua54", "vendored"] }
 ```
 
 `main.rs`
@@ -168,7 +171,7 @@ Add to `Cargo.toml`:
 crate-type = ["cdylib"]
 
 [dependencies]
-mlua = { version = "0.11", features = ["lua54", "module"] }
+mlua = { version = "0.12", features = ["lua54", "module"] }
 ```
 
 `lib.rs`:

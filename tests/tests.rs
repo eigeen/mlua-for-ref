@@ -5,9 +5,10 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::{error, f32, f64, fmt};
 
+use mlua::chunk::ChunkMode;
 use mlua::{
-    ChunkMode, Error, ExternalError, Function, Lua, LuaOptions, Nil, Result, StdLib, Table, UserData, Value,
-    Variadic, ffi,
+    Error, ExternalError, Function, Lua, LuaOptions, Nil, Result, StdLib, Table, UserData, Value, Variadic,
+    ffi,
 };
 
 #[test]
@@ -132,9 +133,9 @@ fn test_exec() -> Result<()> {
 fn test_eval() -> Result<()> {
     let lua = Lua::new();
 
-    assert_eq!(lua.load("1 + 1").eval::<i32>()?, 2);
+    assert_eq!(lua.load("\t1 + 1").eval::<i32>()?, 2);
     assert_eq!(lua.load("false == false").eval::<bool>()?, true);
-    assert_eq!(lua.load("return 1 + 2").eval::<i32>()?, 3);
+    assert_eq!(lua.load("\nreturn 1 + 2").eval::<i32>()?, 3);
     match lua.load("if true then").eval::<()>() {
         Err(Error::SyntaxError {
             incomplete_input: true,
@@ -187,7 +188,7 @@ fn test_load_mode() -> Result<()> {
     #[cfg(not(feature = "luau"))]
     let bytecode = lua.load("return 1 + 1").into_function()?.dump(true);
     #[cfg(feature = "luau")]
-    let bytecode = mlua::Compiler::new().compile("return 1 + 1")?;
+    let bytecode = mlua::chunk::Compiler::new().compile("return 1 + 1")?;
     assert_eq!(lua.load(&bytecode).eval::<i32>()?, 2);
     assert_eq!(lua.load(&bytecode).set_mode(ChunkMode::Binary).eval::<i32>()?, 2);
     match lua.load(&bytecode).set_mode(ChunkMode::Text).exec() {
@@ -1662,15 +1663,33 @@ fn test_gc_drop_ref_thread() -> Result<()> {
 #[cfg(not(feature = "luau"))]
 #[test]
 fn test_get_or_init_from_ptr() -> Result<()> {
+    struct ExternalUserData(i64);
+
+    impl UserData for ExternalUserData {
+        fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+            methods.add_method("doubled", |_, this, ()| Ok(this.0 * 2));
+        }
+    }
+
     // This would not work with Luau, the state must be init by mlua internally
     let state = unsafe { ffi::luaL_newstate() };
 
     let mut lua = unsafe { Lua::get_or_init_from_ptr(state) };
     lua.globals().set("hello", "world678")?;
+    lua.globals()
+        .set("external_userdata", lua.create_userdata(ExternalUserData(21))?)?;
+    lua.globals().set(
+        "external_error",
+        lua.create_function(|_, ()| Err::<(), _>(Error::runtime("external state error")))?,
+    )?;
 
     // The same Lua instance must be returned
     lua = unsafe { Lua::get_or_init_from_ptr(state) };
     assert_eq!(lua.globals().get::<String>("hello")?, "world678");
+    assert_eq!(lua.load("return external_userdata:doubled()").eval::<i64>()?, 42);
+    let external_error = lua.globals().get::<Function>("external_error")?;
+    let error = external_error.call::<()>(()).expect_err("callback must return a Lua error");
+    assert!(error.to_string().contains("external state error"));
 
     unsafe { ffi::lua_close(state) };
 

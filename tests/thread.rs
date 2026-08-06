@@ -1,5 +1,8 @@
 use std::panic::catch_unwind;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+use mlua::thread::{ThreadEvent, ThreadStatus, ThreadTriggers};
 use mlua::{Error, Function, IntoLua, Lua, Result, Thread, Value};
 
 #[test]
@@ -103,6 +106,32 @@ fn test_thread() -> Result<()> {
     let result = thread.resume::<()>(());
     assert!(result.is_ok(), "unexpected result: {result:?}");
 
+    // A thread that has resumed another thread (still running) is "normal".
+    let check_outer = lua.create_function(|lua, ()| {
+        let outer: Thread = lua.globals().get("outer")?;
+        assert!(outer.is_normal());
+        assert!(
+            matches!(outer.resume::<()>(()), Err(Error::CoroutineUnresumable)),
+            "resuming a `normal` thread must be unresumable",
+        );
+        Ok(())
+    })?;
+    lua.globals().set("check_outer", check_outer)?;
+    let outer = lua.create_thread(
+        lua.load(
+            r#"
+            function()
+                local inner = coroutine.create(function() check_outer() end)
+                assert(coroutine.resume(inner))
+            end
+            "#,
+        )
+        .eval()?,
+    )?;
+    lua.globals().set("outer", &outer)?;
+    outer.resume::<()>(())?;
+    assert!(outer.is_finished());
+
     Ok(())
 }
 
@@ -154,7 +183,11 @@ fn test_thread_reset() -> Result<()> {
         assert!(thread.reset(func.clone()).is_err());
         assert!(thread.is_error());
     }
-    #[cfg(any(feature = "lua55", all(feature = "lua54", not(feature = "vendored")), feature = "luau"))]
+    #[cfg(any(
+        feature = "lua55",
+        all(feature = "lua54", not(feature = "vendored")),
+        feature = "luau"
+    ))]
     {
         assert!(thread.reset(func.clone()).is_ok());
         assert!(thread.is_resumable());
@@ -277,6 +310,255 @@ fn test_thread_resume_bad_arg() -> Result<()> {
     assert!(matches!(res, Err(Error::RuntimeError(msg)) if msg == "bad arg"));
     let res = f.resume::<String>(()).unwrap();
     assert_eq!(res, "okay");
+
+    Ok(())
+}
+
+#[test]
+fn test_thread_event_create() -> Result<()> {
+    let lua = Lua::new();
+
+    let created = Arc::new(AtomicBool::new(false));
+    let created2 = created.clone();
+    lua.set_thread_event_callback(ThreadTriggers::ON_CREATE, move |_lua, event| {
+        assert!(matches!(event, ThreadEvent::Create(_)));
+        created2.store(true, Ordering::Relaxed);
+        Ok(())
+    });
+
+    let _thread = lua.create_thread(lua.create_function(|_, ()| Ok(()))?)?;
+    assert!(created.load(Ordering::Relaxed));
+
+    Ok(())
+}
+
+#[test]
+fn test_thread_event_create_recursive() -> Result<()> {
+    let lua = Lua::new();
+
+    let count = Arc::new(AtomicU32::new(0));
+    let count2 = count.clone();
+    lua.set_thread_event_callback(ThreadTriggers::ON_CREATE, move |lua, event| {
+        assert!(matches!(event, ThreadEvent::Create(_)));
+        count2.fetch_add(1, Ordering::Relaxed);
+        // Creating a thread inside the callback
+        let _ = lua.create_thread(lua.load("return 321").into_function().unwrap())?;
+        Ok(())
+    });
+
+    let _t = lua.create_thread(lua.load("return 123").into_function()?)?;
+    assert_eq!(count.load(Ordering::Relaxed), 1);
+
+    Ok(())
+}
+
+#[test]
+fn test_thread_event_create_error() -> Result<()> {
+    let lua = Lua::new();
+
+    lua.set_thread_event_callback(ThreadTriggers::ON_CREATE, move |_, _| Err(Error::runtime("blah")));
+
+    let result = lua.create_thread(lua.load("return 123").into_function()?);
+    assert!(result.is_err());
+    assert!(matches!(result, Err(Error::RuntimeError(err)) if err.contains("blah")));
+
+    Ok(())
+}
+
+#[test]
+fn test_thread_event_resume() -> Result<()> {
+    let lua = Lua::new();
+
+    let count = Arc::new(AtomicBool::new(false));
+    let count2 = count.clone();
+    lua.set_thread_event_callback(ThreadTriggers::ON_RESUME, move |_lua, event| {
+        assert!(matches!(event, ThreadEvent::Resume(_)));
+        count2.store(true, Ordering::Relaxed);
+        Ok(())
+    });
+
+    let thread = lua.create_thread(lua.load("return 42").into_function()?)?;
+    thread.resume::<()>(())?;
+
+    assert!(count.load(Ordering::Relaxed));
+    Ok(())
+}
+
+#[test]
+fn test_thread_event_resume_error() -> Result<()> {
+    let lua = Lua::new();
+
+    lua.set_thread_event_callback(ThreadTriggers::ON_RESUME, move |_lua, _event| {
+        Err(Error::runtime("abort resume"))
+    });
+
+    let thread = lua.create_thread(lua.load("return 42").into_function()?)?;
+    let err = thread.resume::<()>(()).unwrap_err();
+    assert!(matches!(err, Error::RuntimeError(msg) if msg == "abort resume"));
+    assert!(thread.is_resumable());
+
+    Ok(())
+}
+
+#[test]
+fn test_thread_event_yield() -> Result<()> {
+    let lua = Lua::new();
+
+    let count = Arc::new(AtomicBool::new(false));
+    let count2 = count.clone();
+    lua.set_thread_event_callback(ThreadTriggers::ON_YIELD, move |_lua, event| {
+        assert!(matches!(event, ThreadEvent::Yield(_)));
+        count2.store(true, Ordering::Relaxed);
+        Ok(())
+    });
+
+    let thread = lua.create_thread(lua.load("coroutine.yield(1) return 2").into_function()?)?;
+    let val = thread.resume::<i32>(())?;
+    assert_eq!(val, 1);
+    assert!(count.load(Ordering::Relaxed));
+
+    // Reset flag and resume to completion
+    count.store(false, Ordering::Relaxed);
+    let val = thread.resume::<i32>(())?;
+    assert_eq!(val, 2);
+    // Yield hook should not fire on the final return
+    assert!(!count.load(Ordering::Relaxed));
+    assert!(thread.is_finished());
+
+    Ok(())
+}
+
+#[test]
+fn test_thread_event_yield_error() -> Result<()> {
+    let lua = Lua::new();
+
+    lua.set_thread_event_callback(ThreadTriggers::ON_YIELD, move |_lua, _event| {
+        Err(Error::runtime("yield error"))
+    });
+
+    let thread = lua.create_thread(lua.load("coroutine.yield(1)").into_function()?)?;
+    let err = thread.resume::<()>(()).unwrap_err();
+    assert!(matches!(err, Error::RuntimeError(msg) if msg == "yield error"));
+
+    Ok(())
+}
+
+#[test]
+fn test_thread_event_reentrant_resume() -> Result<()> {
+    let lua = Lua::new();
+
+    // Self-resume from within the yield callback is not allowed
+    let reentered = Arc::new(AtomicBool::new(false));
+    let reentered2 = reentered.clone();
+    lua.set_thread_event_callback(ThreadTriggers::ON_YIELD, move |_lua, event| {
+        if let ThreadEvent::Yield(thread) = event
+            && !reentered2.swap(true, Ordering::Relaxed)
+        {
+            assert_eq!(thread.status(), ThreadStatus::Resumable);
+            assert!(thread.is_resumable());
+            let err = thread.resume::<Value>(()).unwrap_err();
+            assert!(
+                matches!(&err, Error::RuntimeError(msg) if msg.contains("from within its own event callback")),
+                "unexpected error: {err:?}"
+            );
+        }
+        Ok(())
+    });
+
+    let thread = lua.create_thread(
+        lua.load("coroutine.yield(1, 2, 3, 4, 5) return 7")
+            .into_function()?,
+    )?;
+
+    let vals = thread.resume::<(i32, i32, i32, i32, i32)>(())?;
+    assert_eq!(vals, (1, 2, 3, 4, 5));
+    assert!(reentered.load(Ordering::Relaxed));
+
+    assert_eq!(thread.resume::<i32>(())?, 7);
+    assert!(thread.is_finished());
+
+    Ok(())
+}
+
+#[test]
+fn test_thread_event_swap() -> Result<()> {
+    let lua = Lua::new();
+
+    let count = Arc::new(AtomicU32::new(0));
+    let count2 = count.clone();
+    lua.set_thread_event_callback(ThreadTriggers::ON_RESUME, move |_lua, _event| {
+        count2.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    });
+
+    let thread = lua.create_thread(lua.load("coroutine.yield(1) return 2").into_function()?)?;
+    thread.resume::<i32>(())?;
+    assert_eq!(count.load(Ordering::Relaxed), 1);
+
+    // Replace callback with a new one
+    let count3 = Arc::new(AtomicU32::new(0));
+    let count4 = count3.clone();
+    lua.set_thread_event_callback(ThreadTriggers::new().on_resume(), move |_lua, _event| {
+        count4.fetch_add(10, Ordering::Relaxed);
+        Ok(())
+    });
+
+    thread.resume::<i32>(())?;
+    assert_eq!(count.load(Ordering::Relaxed), 1);
+    assert_eq!(count3.load(Ordering::Relaxed), 10);
+
+    // Remove callback
+    lua.remove_thread_event_callback();
+    thread.reset(lua.load("return 0").into_function()?)?;
+    thread.resume::<()>(())?;
+    assert_eq!(count3.load(Ordering::Relaxed), 10); // unchanged
+
+    Ok(())
+}
+
+#[cfg(feature = "luau")]
+#[test]
+fn test_thread_event_luau_resume_error() -> Result<()> {
+    let lua = Lua::new();
+
+    let fired = Arc::new(AtomicBool::new(false));
+    let fired2 = fired.clone();
+    lua.set_thread_event_callback(ThreadTriggers::ON_RESUME, move |_lua, event| {
+        assert!(matches!(event, ThreadEvent::Resume(_)));
+        fired2.store(true, Ordering::Relaxed);
+        Ok(())
+    });
+
+    let thread = lua.create_thread(lua.load("return 42").into_function()?)?;
+    let _ = thread.resume_error::<()>("test error");
+    assert!(fired.load(Ordering::Relaxed));
+
+    Ok(())
+}
+
+#[cfg(feature = "luau")]
+#[test]
+fn test_thread_event_create_from_lua() -> Result<()> {
+    let lua = Lua::new();
+
+    let count = std::cell::Cell::new(0);
+    lua.set_thread_event_callback(ThreadTriggers::ON_CREATE, move |_, _| {
+        count.set(count.get() + 1);
+        if count.get() == 2 {
+            return Err(Error::runtime("thread limit exceeded"));
+        }
+        Ok(())
+    });
+    let result = lua
+        .load(
+            r#"
+            local co = coroutine.wrap(function() return coroutine.create(print) end)
+            co()
+    "#,
+        )
+        .exec();
+    assert!(result.is_err());
+    assert!(matches!(result, Err(Error::RuntimeError(err)) if err.contains("thread limit exceeded")));
 
     Ok(())
 }

@@ -1,6 +1,8 @@
+#[cfg(not(target_os = "wasi"))]
 use std::{fs, io};
 
-use mlua::{Chunk, ChunkMode, Lua, Result};
+use mlua::chunk::{Chunk, ChunkMode};
+use mlua::{Lua, Result};
 
 #[test]
 fn test_chunk_methods() -> Result<()> {
@@ -85,7 +87,7 @@ fn test_chunk_macro() -> Result<()> {
     data.raw_set("num", 1)?;
 
     let ud = mlua::AnyUserData::wrap("hello");
-    let f = mlua::Function::wrap(|| Ok(()));
+    let f = mlua::Function::wrap(|| Ok::<_, mlua::Error>(()));
 
     lua.globals().set("g", 123)?;
 
@@ -109,13 +111,28 @@ fn test_chunk_macro() -> Result<()> {
 
     assert_eq!(lua.globals().get::<i32>("s")?, 321);
 
+    // Check line numbers in error reporting
+    match lua
+        .load(mlua::chunk! {
+            local x = 1
+            -- comment
+            error("boom")
+        })
+        .exec()
+    {
+        Err(mlua::Error::RuntimeError(ref msg)) => {
+            assert!(msg.contains(":3:"), "expected line 3, got: {msg}");
+        }
+        other => panic!("expected RuntimeError, got {other:?}"),
+    }
+
     Ok(())
 }
 
 #[cfg(feature = "luau")]
 #[test]
 fn test_compiler() -> Result<()> {
-    let compiler = mlua::Compiler::new()
+    let compiler = mlua::chunk::Compiler::new()
         .set_optimization_level(2)
         .set_debug_level(2)
         .set_type_info_level(1)
@@ -142,7 +159,8 @@ fn test_compiler() -> Result<()> {
 #[cfg(feature = "luau")]
 #[test]
 fn test_compiler_library_constants() {
-    use mlua::{Compiler, Vector};
+    use mlua::Vector;
+    use mlua::chunk::Compiler;
 
     let compiler = Compiler::new()
         .set_optimization_level(2)

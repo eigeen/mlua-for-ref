@@ -1,4 +1,4 @@
-use std::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign};
+use std::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Not};
 
 /// Flags describing the set of lua standard libraries to load.
 #[derive(Copy, Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -73,10 +73,15 @@ impl StdLib {
     #[cfg_attr(docsrs, doc(cfg(feature = "luau")))]
     pub const VECTOR: StdLib = StdLib(1 << 10);
 
+    /// [`integer`](https://luau.org/library#integer-library) library
+    #[cfg(any(feature = "luau", doc))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "luau")))]
+    pub const INTEGER: StdLib = StdLib(1 << 11);
+
     /// [`jit`](http://luajit.org/ext_jit.html) library
     #[cfg(any(feature = "luajit", doc))]
     #[cfg_attr(docsrs, doc(cfg(feature = "luajit")))]
-    pub const JIT: StdLib = StdLib(1 << 11);
+    pub const JIT: StdLib = StdLib(1 << 12);
 
     /// (**unsafe**) [`ffi`](http://luajit.org/ext_ffi.html) library
     #[cfg(any(feature = "luajit", doc))]
@@ -137,5 +142,12 @@ impl BitXor for StdLib {
 impl BitXorAssign for StdLib {
     fn bitxor_assign(&mut self, rhs: Self) {
         *self = StdLib(self.0 ^ rhs.0)
+    }
+}
+
+impl Not for StdLib {
+    type Output = Self;
+    fn not(self) -> Self::Output {
+        StdLib(!self.0)
     }
 }

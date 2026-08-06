@@ -1,3 +1,8 @@
+//! Lua error handling.
+//!
+//! This module provides the [`Error`] type returned by all fallible `mlua` operations, together
+//! with extension traits for adapting Rust errors for use within Lua.
+
 use std::error::Error as StdError;
 use std::fmt;
 use std::io::Error as IoError;
@@ -285,7 +290,7 @@ impl fmt::Display for Error {
                     // Try to find local traceback within the full traceback
                     if let Some(pos) = full_traceback.find(traceback) {
                         write!(fmt, "{}", &full_traceback[..pos])?;
-                        writeln!(fmt, ">{}", &full_traceback[pos..].trim_end())?;
+                        writeln!(fmt, ">{}", full_traceback[pos..].trim_end())?;
                     } else {
                         writeln!(fmt, "{}", full_traceback.trim_end())?;
                     }
@@ -340,22 +345,35 @@ impl Error {
     /// Wraps an external error object.
     #[inline]
     pub fn external<T: Into<Box<DynStdError>>>(err: T) -> Self {
-        Error::ExternalError(err.into().into())
+        let boxed = err.into();
+        match boxed.downcast::<Self>() {
+            Ok(err) => *err,
+            Err(boxed) => Error::ExternalError(boxed.into()),
+        }
     }
 
-    /// Attempts to downcast the external error object to a concrete type by reference.
+    /// Attempts to downcast to a concrete external error type by reference.
+    ///
+    /// The search descends through wrapping layers following the same path as [`Error::chain`].
     pub fn downcast_ref<T>(&self) -> Option<&T>
     where
         T: StdError + 'static,
     {
         match self {
             Error::ExternalError(err) => err.downcast_ref(),
-            Error::WithContext { cause, .. } => Self::downcast_ref(cause),
+            Error::BadArgument { cause, .. }
+            | Error::CallbackError { cause, .. }
+            | Error::WithContext { cause, .. } => Self::downcast_ref(cause),
             _ => None,
         }
     }
 
-    /// An iterator over the chain of nested errors wrapped by this Error.
+    /// An iterator over the chain of nested errors wrapped by this `Error`.
+    ///
+    /// Iteration starts with `self` and descends through wrapping layers.
+    /// A bare [`Error::ExternalError`] wrapper is skipped in favor of the error it wraps.
+    /// The chain stops at the innermost error and does not follow the external error's own
+    /// [`StdError::source`] chain.
     pub fn chain(&self) -> impl Iterator<Item = &(dyn StdError + 'static)> {
         Chain {
             root: self,
@@ -550,10 +568,8 @@ impl<'a> Iterator for Chain<'a> {
 
 #[cfg(test)]
 mod assertions {
-    use super::*;
-
     #[cfg(not(feature = "error-send"))]
-    static_assertions::assert_not_impl_any!(Error: Send, Sync);
+    static_assertions::assert_not_impl_any!(super::Error: Send, Sync);
     #[cfg(feature = "send")]
-    static_assertions::assert_impl_all!(Error: Send, Sync);
+    static_assertions::assert_impl_all!(super::Error: Send, Sync);
 }

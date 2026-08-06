@@ -20,9 +20,6 @@ pub use either::Either;
 pub use registry_key::RegistryKey;
 pub(crate) use value_ref::ValueRef;
 
-#[cfg(feature = "async")]
-pub(crate) use value_ref::ValueRefIndex;
-
 /// Type of Lua integer numbers.
 pub type Integer = ffi::lua_Integer;
 /// Type of Lua floating point numbers.
@@ -70,6 +67,7 @@ pub(crate) type AsyncCallbackUpvalue = Upvalue<AsyncCallback>;
 pub(crate) type AsyncPollUpvalue = Upvalue<Option<BoxFuture<'static, Result<c_int>>>>;
 
 /// Type to set next Lua VM action after executing interrupt or hook function.
+#[non_exhaustive]
 pub enum VmState {
     Continue,
     /// Yield the current thread.
@@ -96,17 +94,11 @@ pub(crate) type InterruptCallback = XRc<dyn Fn(&Lua) -> Result<VmState> + Send>;
 #[cfg(all(not(feature = "send"), feature = "luau"))]
 pub(crate) type InterruptCallback = XRc<dyn Fn(&Lua) -> Result<VmState>>;
 
-#[cfg(all(feature = "send", feature = "luau"))]
-pub(crate) type ThreadCreationCallback = XRc<dyn Fn(&Lua, crate::Thread) -> Result<()> + Send>;
+#[cfg(feature = "send")]
+pub(crate) type ThreadEventCallback = XRc<dyn Fn(&Lua, crate::thread::ThreadEvent) -> Result<()> + Send>;
 
-#[cfg(all(not(feature = "send"), feature = "luau"))]
-pub(crate) type ThreadCreationCallback = XRc<dyn Fn(&Lua, crate::Thread) -> Result<()>>;
-
-#[cfg(all(feature = "send", feature = "luau"))]
-pub(crate) type ThreadCollectionCallback = XRc<dyn Fn(crate::LightUserData) + Send>;
-
-#[cfg(all(not(feature = "send"), feature = "luau"))]
-pub(crate) type ThreadCollectionCallback = XRc<dyn Fn(crate::LightUserData)>;
+#[cfg(not(feature = "send"))]
+pub(crate) type ThreadEventCallback = XRc<dyn Fn(&Lua, crate::thread::ThreadEvent) -> Result<()>>;
 
 #[cfg(feature = "send")]
 #[cfg(any(feature = "lua55", feature = "lua54"))]
@@ -128,13 +120,17 @@ pub trait MaybeSend {}
 #[cfg(not(feature = "send"))]
 impl<T> MaybeSend for T {}
 
-/// A trait that adds `Sync` requirement if `send` feature is enabled.
+/// Adds a `Sync` requirement to userdata types when the `send` feature is enabled.
+///
+/// It is automatically implemented for all applicable types.
 #[cfg(feature = "send")]
 pub trait MaybeSync: Sync {}
 #[cfg(feature = "send")]
 impl<T: Sync> MaybeSync for T {}
 
-/// A trait that adds `Sync` requirement if `send` feature is enabled.
+/// Adds a `Sync` requirement to userdata types when the `send` feature is enabled.
+///
+/// It is automatically implemented for all applicable types.
 #[cfg(not(feature = "send"))]
 pub trait MaybeSync {}
 #[cfg(not(feature = "send"))]

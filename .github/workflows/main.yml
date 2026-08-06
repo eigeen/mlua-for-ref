@@ -9,7 +9,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         rust: [stable]
-        lua: [lua55, lua54, lua53, lua52, lua51, luajit, luau, luau-jit, luau-vector4]
+        lua: [lua54, lua53, lua52, lua51, luajit, luau, luau-jit, luau-vector4]
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
@@ -30,8 +30,12 @@ jobs:
           cargo build --features "${{ matrix.lua }},vendored,async,serde,macros,anyhow,userdata-wrappers"
           cargo build --features "${{ matrix.lua }},vendored,async,serde,macros,anyhow,userdata-wrappers,send"
         shell: bash
+      - name: Verify REFramework Lua source version
+        if: ${{ matrix.os == 'ubuntu-latest' && matrix.lua == 'lua54' }}
+        run: cargo tree -i lua-src | grep 'lua-src v543.0.0'
+        shell: bash
       - name: Build ${{ matrix.lua }} pkg-config
-        if: ${{ matrix.os == 'ubuntu-latest' && matrix.lua != 'lua55' }}
+        if: ${{ matrix.os == 'ubuntu-latest' }}
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends liblua5.4-dev liblua5.3-dev liblua5.2-dev liblua5.1-0-dev libluajit-5.1-dev
@@ -43,7 +47,7 @@ jobs:
     needs: build
     strategy:
       matrix:
-        lua: [lua55, lua54, lua53, lua52, lua51, luajit]
+        lua: [lua54, lua53, lua52, lua51, luajit]
     steps:
       - uses: actions/checkout@main
       - uses: dtolnay/rust-toolchain@stable
@@ -65,7 +69,7 @@ jobs:
     needs: build
     strategy:
       matrix:
-        lua: [lua55, lua54, lua53, lua52, lua51]
+        lua: [lua54, lua53, lua52, lua51]
     steps:
       - uses: actions/checkout@main
       - uses: dtolnay/rust-toolchain@stable
@@ -89,7 +93,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         rust: [stable, nightly]
-        lua: [lua55, lua54, lua53, lua52, lua51, luajit, luajit52, luau, luau-jit, luau-vector4]
+        lua: [lua54, lua53, lua52, lua51, luajit, luajit52, luau, luau-jit, luau-vector4]
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
@@ -110,8 +114,8 @@ jobs:
           cargo test --features "${{ matrix.lua }},vendored,async,serde,macros,anyhow,userdata-wrappers"
           cargo test --features "${{ matrix.lua }},vendored,async,serde,macros,anyhow,userdata-wrappers,send"
         shell: bash
-      - name: Run compile tests (macos lua55)
-        if: ${{ matrix.os == 'macos-latest' && matrix.lua == 'lua55' }}
+      - name: Run compile tests (macos lua54)
+        if: ${{ matrix.os == 'macos-latest' && matrix.lua == 'lua54' }}
         run: |
           TRYBUILD=overwrite cargo test --features "${{ matrix.lua }},vendored" --tests -- --ignored
           TRYBUILD=overwrite cargo test --features "${{ matrix.lua }},vendored,async,send,serde,macros" --tests -- --ignored
@@ -125,7 +129,7 @@ jobs:
       matrix:
         os: [ubuntu-latest]
         rust: [nightly]
-        lua: [lua55, lua54, lua53, lua52, lua51, luajit, luau, luau-jit, luau-vector4]
+        lua: [lua54, lua53, lua52, lua51, luajit, luau, luau-jit, luau-vector4]
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
@@ -152,7 +156,7 @@ jobs:
       matrix:
         os: [ubuntu-latest]
         rust: [nightly]
-        lua: [lua55, lua54, lua53, lua52, lua51, luajit, luau, luau-jit, luau-vector4]
+        lua: [lua54, lua53, lua52, lua51, luajit, luau, luau-jit, luau-vector4]
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
@@ -178,7 +182,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
         rust: [stable]
-        lua: [lua55, lua54, lua53, lua52, lua51, luajit]
+        lua: [lua54, lua53, lua52, lua51, luajit]
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
@@ -212,7 +216,7 @@ jobs:
       - uses: actions/checkout@main
       - name: Install Rust & Lua
         run: |
-          pacman -S --noconfirm mingw-w64-x86_64-rust mingw-w64-x86_64-lua mingw-w64-x86_64-luajit mingw-w64-x86_64-pkg-config
+          pacman -S --noconfirm mingw-w64-x86_64-rust mingw-w64-x86_64-lua54 mingw-w64-x86_64-lua mingw-w64-x86_64-luajit mingw-w64-x86_64-pkg-config
       - name: Run ${{ matrix.lua }} module tests
         run: |
           (cd tests/module && cargo build --release --features "${{ matrix.lua }}")
@@ -224,7 +228,7 @@ jobs:
     needs: build
     strategy:
       matrix:
-        lua: [lua55, lua54, lua53, lua52, lua51, luau]
+        lua: [lua54, lua53, lua52, lua51, luau]
     steps:
       - uses: actions/checkout@main
       - uses: dtolnay/rust-toolchain@stable
@@ -246,7 +250,7 @@ jobs:
     needs: build
     strategy:
       matrix:
-        lua: [lua55, lua54, lua53, lua52, lua51]
+        lua: [lua54, lua53, lua52, lua51]
     steps:
       - uses: actions/checkout@main
       - uses: dtolnay/rust-toolchain@stable
@@ -290,7 +294,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        lua: [lua55, lua54, lua53, lua52, lua51, luajit, luau, luau-jit, luau-vector4]
+        lua: [lua54, lua53, lua52, lua51, luajit, luau, luau-jit, luau-vector4]
     steps:
       - uses: actions/checkout@main
       - uses: dtolnay/rust-toolchain@stable

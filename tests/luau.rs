@@ -1,12 +1,11 @@
 #![cfg(feature = "luau")]
 
-use std::cell::Cell;
 use std::fmt::Debug;
-use std::os::raw::c_void;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use mlua::{Compiler, Error, Function, Lua, LuaOptions, Result, StdLib, Table, Value, Vector, VmState};
+use mlua::chunk::Compiler;
+use mlua::{Error, Function, Lua, LuaOptions, ObjectLike, Result, StdLib, Table, Value, Vector, VmState};
 
 #[test]
 fn test_version() -> Result<()> {
@@ -20,10 +19,11 @@ fn test_version() -> Result<()> {
 fn test_vectors() -> Result<()> {
     let lua = Lua::new();
 
-    let v: Vector = lua
+    let v: Value = lua
         .load("vector.create(1, 2, 3) + vector.create(3, 2, 1)")
         .eval()?;
-    assert_eq!(v, [4.0, 4.0, 4.0]);
+    assert!(v.is_vector());
+    assert_eq!(v.as_vector().unwrap(), [4.0, 4.0, 4.0]);
 
     // Test conversion into Rust array
     let v: [f64; 3] = lua.load("vector.create(1, 2, 3)").eval()?;
@@ -60,10 +60,11 @@ fn test_vectors() -> Result<()> {
 fn test_vectors() -> Result<()> {
     let lua = Lua::new();
 
-    let v: Vector = lua
+    let v: Value = lua
         .load("vector.create(1, 2, 3, 4) + vector.create(4, 3, 2, 1)")
         .eval()?;
-    assert_eq!(v, [5.0, 5.0, 5.0, 5.0]);
+    assert!(v.is_vector());
+    assert_eq!(v.as_vector().unwrap(), [5.0, 5.0, 5.0, 5.0]);
 
     // Test conversion into Rust array
     let v: [f64; 4] = lua.load("vector.create(1, 2, 3, 4)").eval()?;
@@ -97,7 +98,6 @@ fn test_vectors() -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "luau-vector4"))]
 #[test]
 fn test_vector_metatable() -> Result<()> {
     let lua = Lua::new();
@@ -357,83 +357,28 @@ fn test_fflags() {
     assert!(Lua::set_fflag("UnknownFlag", true).is_err());
 }
 
+#[cfg(feature = "luau-jit")]
 #[test]
-fn test_thread_events() -> Result<()> {
+fn test_jit_inliner() -> Result<()> {
     let lua = Lua::new();
+    lua.set_jit_options(mlua::state::JitOptions::new().inliner(true));
 
-    let count = Arc::new(AtomicU64::new(0));
-    let thread_data: Arc<(AtomicPtr<c_void>, AtomicBool)> = Arc::new(Default::default());
-
-    let (count2, thread_data2) = (count.clone(), thread_data.clone());
-    lua.set_thread_creation_callback(move |_, thread| {
-        count2.fetch_add(1, Ordering::Relaxed);
-        (thread_data2.0).store(thread.to_pointer() as *mut _, Ordering::Relaxed);
-        thread_data2.1.store(false, Ordering::Relaxed);
-        Ok(())
-    });
-    let (count3, thread_data3) = (count.clone(), thread_data.clone());
-    lua.set_thread_collection_callback(move |thread_ptr| {
-        count3.fetch_add(1, Ordering::Relaxed);
-        if thread_data3.0.load(Ordering::Relaxed) == thread_ptr.0 {
-            thread_data3.1.store(true, Ordering::Relaxed);
-        }
-    });
-
-    let t = lua.create_thread(lua.load("return 123").into_function()?)?;
-    assert_eq!(count.load(Ordering::Relaxed), 1);
-    let t_ptr = t.to_pointer();
-    assert_eq!(t_ptr, thread_data.0.load(Ordering::Relaxed));
-    assert!(!thread_data.1.load(Ordering::Relaxed));
-
-    // Thead will be destroyed after GC cycle
-    drop(t);
-    lua.gc_collect()?;
-    assert_eq!(count.load(Ordering::Relaxed), 2);
-    assert_eq!(t_ptr, thread_data.0.load(Ordering::Relaxed));
-    assert!(thread_data.1.load(Ordering::Relaxed));
-
-    // Check that recursion is not allowed
-    let count4 = count.clone();
-    lua.set_thread_creation_callback(move |lua, _value| {
-        count4.fetch_add(1, Ordering::Relaxed);
-        let _ = lua.create_thread(lua.load("return 123").into_function().unwrap())?;
-        Ok(())
-    });
-    let t = lua.create_thread(lua.load("return 123").into_function()?)?;
-    assert_eq!(count.load(Ordering::Relaxed), 3);
-
-    lua.remove_thread_callbacks();
-    drop(t);
-    lua.gc_collect()?;
-    assert_eq!(count.load(Ordering::Relaxed), 3);
-
-    // Test error inside callback
-    lua.set_thread_creation_callback(move |_, _| Err(Error::runtime("error when processing thread event")));
-    let result = lua.create_thread(lua.load("return 123").into_function()?);
-    assert!(result.is_err());
-    assert!(
-        matches!(result, Err(Error::RuntimeError(err)) if err.contains("error when processing thread event"))
-    );
-
-    // Test context switch when running Lua script
-    let count = Cell::new(0);
-    lua.set_thread_creation_callback(move |_, _| {
-        count.set(count.get() + 1);
-        if count.get() == 2 {
-            return Err(Error::runtime("thread limit exceeded"));
-        }
-        Ok(())
-    });
-    let result = lua
+    // An inlinable helper called in a hot loop.
+    let sum = lua
         .load(
             r#"
-            local co = coroutine.wrap(function() return coroutine.create(print) end)
-            co()
-    "#,
+            local function add(a, b)
+                return a + b
+            end
+            local sum = 0
+            for i = 1, 1000 do
+                sum = add(sum, i)
+            end
+            return sum
+        "#,
         )
-        .exec();
-    assert!(result.is_err());
-    assert!(matches!(result, Err(Error::RuntimeError(err)) if err.contains("thread limit exceeded")));
+        .eval::<i64>()?;
+    assert_eq!(sum, 500500);
 
     Ok(())
 }
@@ -529,6 +474,24 @@ fn test_heap_dump() -> Result<()> {
     // Remove category filter
     let size_by_udtype_all = dump.size_by_userdata(None);
     assert!(size_by_udtype.len() < size_by_udtype_all.len());
+
+    Ok(())
+}
+
+#[test]
+fn test_integer64_type() -> Result<()> {
+    let lua = Lua::new();
+
+    _ = Lua::set_fflag("LuauIntegerType2", true);
+
+    let integer_lib = lua.globals().get::<Table>("integer")?;
+    let n = integer_lib.call_function::<i64>("create", 42)?;
+    assert_eq!(n, 42);
+
+    let n: i64 = lua.load("return 42i").eval()?;
+    assert_eq!(n, 42);
+    let n: i64 = lua.load("return -42i").eval()?;
+    assert_eq!(n, -42);
 
     Ok(())
 }

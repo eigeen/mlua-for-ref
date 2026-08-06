@@ -7,7 +7,7 @@ use futures_util::stream::TryStreamExt;
 use tokio::sync::Mutex;
 
 use mlua::{
-    Error, Function, Lua, LuaOptions, MultiValue, ObjectLike, Result, StdLib, Table, UserData,
+    Error, Function, Lua, LuaOptions, MultiValue, ObjectLike, Result, StdLib, Table, Thread, UserData,
     UserDataMethods, UserDataRef, Value,
 };
 
@@ -41,7 +41,7 @@ async fn test_async_function_wrap() -> Result<()> {
 
     let f = Function::wrap_async(|s: String| async move {
         tokio::task::yield_now().await;
-        Ok(s)
+        Ok::<_, Error>(s)
     });
     lua.globals().set("f", f)?;
     let res: String = lua.load(r#"f("hello")"#).eval_async().await?;
@@ -687,6 +687,49 @@ async fn test_async_hook() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+#[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53"))]
+async fn test_async_hook_yield_preserves_stack() -> Result<()> {
+    use std::future::{Future, poll_fn};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::Poll;
+
+    let lua = Lua::new();
+
+    let thread = lua.create_thread(
+        lua.load(
+            r#"
+            local x = 40
+            local y = 2
+            return x + y
+        "#,
+        )
+        .into_function()?,
+    )?;
+
+    let yielded = Arc::new(AtomicBool::new(false));
+    let yielded2 = yielded.clone();
+    thread.set_hook(mlua::HookTriggers::EVERY_LINE, move |lua, debug| {
+        if debug.current_line() == Some(4) && !yielded2.swap(true, Ordering::Relaxed) {
+            lua.remove_hook();
+            return Ok(mlua::VmState::Yield);
+        }
+        Ok(mlua::VmState::Continue)
+    })?;
+
+    let mut thread = Box::pin(thread.into_async::<i32>(())?);
+    poll_fn(|cx| {
+        assert!(thread.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    assert!(yielded.load(Ordering::Relaxed));
+    lua.gc_collect()?;
+    assert_eq!(thread.await?, 42);
+
+    Ok(())
+}
+
 #[test]
 fn test_async_yield_with() -> Result<()> {
     let lua = Lua::new();
@@ -715,6 +758,20 @@ fn test_async_yield_with() -> Result<()> {
     assert_eq!(thread.resume::<(i32, i32)>((11, 12))?, (23, 132));
     assert_eq!(thread.resume::<(i32, i32)>((12, 13))?, (0, 0));
     assert!(thread.is_finished());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_async_current_thread() -> Result<()> {
+    let lua = Lua::new();
+
+    let get_inner_thread = lua.create_async_function(move |lua, ()| async move {
+        let f = lua.create_async_function(move |lua, ()| async move { Ok(lua.current_thread()) })?;
+        f.call_async::<Thread>(()).await
+    })?;
+    let inner_thread = get_inner_thread.call_async::<Thread>(()).await?;
+    assert_eq!(inner_thread, lua.current_thread());
 
     Ok(())
 }

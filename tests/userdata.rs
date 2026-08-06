@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use mlua::{
     AnyUserData, Error, ExternalError, Function, Lua, LuaString, MetaMethod, Nil, ObjectLike, Result,
-    UserData, UserDataFields, UserDataMethods, UserDataRef, UserDataRegistry, Value, Variadic,
+    UserData, UserDataFields, UserDataMethods, UserDataOwned, UserDataRef, UserDataRegistry, Value, Variadic,
 };
 
 #[test]
@@ -734,6 +734,43 @@ fn test_metatable() -> Result<()> {
 }
 
 #[test]
+fn test_userdata_type_name() -> Result<()> {
+    struct MyUserData;
+    impl UserData for MyUserData {}
+
+    struct MyUserdataCustom;
+    impl UserData for MyUserdataCustom {
+        fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
+            fields.add_meta_field_with(MetaMethod::Type, |_| Ok("MyCustomName"));
+        }
+    }
+
+    // mlua always sets __name/__type; override with a non-string to test the "userdata" fallback
+    struct MyUserdataInvalid;
+    impl UserData for MyUserdataInvalid {
+        fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
+            fields.add_meta_field_with(MetaMethod::Type, |_| Ok(42_i64));
+        }
+    }
+
+    let lua = Lua::new();
+
+    // Default is the Rust type name
+    let ud = lua.create_userdata(MyUserData)?;
+    assert_eq!(ud.type_name()?, "MyUserData");
+
+    // Custom name from metatable
+    let ud = lua.create_userdata(MyUserdataCustom)?;
+    assert_eq!(ud.type_name()?, "MyCustomName");
+
+    // Invalid type name should fallback to "userdata"
+    let ud = lua.create_userdata(MyUserdataInvalid)?;
+    assert_eq!(ud.type_name()?.to_str()?, "userdata");
+
+    Ok(())
+}
+
+#[test]
 fn test_userdata_proxy() -> Result<()> {
     struct MyUserData(i64);
 
@@ -949,10 +986,11 @@ fn test_userdata_derive() -> Result<()> {
 
     // More complex struct where generics and where clause
 
+    #[rustfmt::skip]
     #[derive(Clone, Copy, mlua::FromLua)]
     struct MyUserData2<'a, T: ?Sized>(&'a T)
     where
-        T: Copy;
+        T: Copy,; // trailing comma is needed for testing
 
     lua.register_userdata_type::<MyUserData2<'static, i32>>(|reg| {
         reg.add_function("val", |_, this: MyUserData2<'static, i32>| Ok(*this.0));
@@ -1419,6 +1457,52 @@ fn test_userdata_get_path() -> Result<()> {
 
     let ud = lua.create_userdata(MyUd)?;
     assert_eq!(ud.get_path::<LuaString>(".value")?, "userdata_value");
+
+    Ok(())
+}
+
+#[test]
+fn test_userdata_owned() -> Result<()> {
+    #[derive(Debug)]
+    struct MyUserdata(Arc<i64>);
+
+    impl UserData for MyUserdata {
+        fn register(registry: &mut UserDataRegistry<Self>) {
+            registry.add_method("num", |_, this, ()| Ok(*this.0));
+        }
+    }
+
+    let lua = Lua::new();
+    let rc = Arc::new(42);
+
+    // It takes ownership and destructs the Lua userdata
+    let ud = lua.create_userdata(MyUserdata(rc.clone()))?;
+    assert_eq!(Arc::strong_count(&rc), 2);
+    let owned: UserDataOwned<MyUserdata> = lua.convert(&ud)?;
+    assert_eq!(*owned.0.0, 42);
+    drop(owned);
+    assert_eq!(Arc::strong_count(&rc), 1);
+    match ud.borrow::<MyUserdata>() {
+        Err(Error::UserDataDestructed) => {}
+        r => panic!("expected UserDataDestructed, got {:?}", r),
+    }
+
+    // Cannot take while borrowed
+    let rc = Arc::new(7);
+    let ud = lua.create_userdata(MyUserdata(rc.clone()))?;
+    let borrowed = ud.borrow::<MyUserdata>()?;
+    match lua.convert::<UserDataOwned<MyUserdata>>(&ud) {
+        Err(Error::UserDataBorrowMutError) => {}
+        r => panic!("expected UserDataBorrowMutError, got {:?}", r),
+    }
+    drop(borrowed);
+
+    // Works as a function parameter
+    let f = lua.create_function(|_, owned: UserDataOwned<MyUserdata>| Ok(*owned.0.0))?;
+    let rc = Arc::new(55);
+    let ud = lua.create_userdata(MyUserdata(rc.clone()))?;
+    assert_eq!(f.call::<i64>(ud)?, 55);
+    assert_eq!(Arc::strong_count(&rc), 1); // dropped after call
 
     Ok(())
 }

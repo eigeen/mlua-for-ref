@@ -1,14 +1,6 @@
 //! Lua string handling.
 //!
 //! This module provides types for working with Lua strings from Rust.
-//!
-//! # Main Types
-//!
-//! - [`LuaString`] - A handle to an internal Lua string (may not be valid UTF-8).
-//! - [`BorrowedStr`] - A borrowed `&str` view of a Lua string that holds a strong reference to the
-//!   Lua state.
-//! - [`BorrowedBytes`] - A borrowed `&[u8]` view of a Lua string that holds a strong reference to
-//!   the Lua state.
 
 use std::borrow::Borrow;
 use std::hash::{Hash, Hasher};
@@ -31,7 +23,7 @@ use {
 /// Handle to an internal Lua string.
 ///
 /// Unlike Rust strings, Lua strings may not be valid UTF-8.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct LuaString(pub(crate) ValueRef);
 
 impl LuaString {
@@ -157,7 +149,10 @@ impl LuaString {
     /// Typically this function is used only for hashing and debug information.
     #[inline]
     pub fn to_pointer(&self) -> *const c_void {
-        self.0.to_pointer()
+        // In Lua < 5.4 (excluding Luau), string pointers are NULL
+        // Use alternative approach
+        let lua = self.0.lua.lock();
+        unsafe { ffi::lua_tostring(lua.ref_thread(), self.0.index) as *const c_void }
     }
 }
 
@@ -188,12 +183,6 @@ where
 {
     fn eq(&self, other: &T) -> bool {
         self.as_bytes() == other.as_ref()
-    }
-}
-
-impl PartialEq for LuaString {
-    fn eq(&self, other: &LuaString) -> bool {
-        self.as_bytes() == other.as_bytes()
     }
 }
 
@@ -279,6 +268,12 @@ impl AsRef<str> for BorrowedStr {
     }
 }
 
+impl Hash for BorrowedStr {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.buf.hash(state);
+    }
+}
+
 impl fmt::Display for BorrowedStr {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         self.buf.fmt(f)
@@ -357,6 +352,12 @@ impl AsRef<[u8]> for BorrowedBytes {
     #[inline(always)]
     fn as_ref(&self) -> &[u8] {
         self.buf
+    }
+}
+
+impl Hash for BorrowedBytes {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.buf.hash(state);
     }
 }
 

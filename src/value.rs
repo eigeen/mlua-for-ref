@@ -7,7 +7,7 @@ use num_traits::FromPrimitive;
 
 use crate::error::{Error, Result};
 use crate::function::Function;
-use crate::string::{BorrowedStr, LuaString};
+use crate::string::LuaString;
 use crate::table::Table;
 use crate::thread::Thread;
 use crate::types::{Integer, LightUserData, Number, ValueRef};
@@ -38,7 +38,7 @@ pub enum Value {
     LightUserData(LightUserData),
     /// An integer number.
     ///
-    /// Any Lua number convertible to a `Integer` will be represented as this variant.
+    /// Any Lua number convertible to an `Integer` will be represented as this variant.
     Integer(Integer),
     /// A floating point number.
     Number(Number),
@@ -128,18 +128,13 @@ impl Value {
     #[inline]
     pub fn to_pointer(&self) -> *const c_void {
         match self {
-            Value::String(LuaString(vref)) => {
-                // In Lua < 5.4 (excluding Luau), string pointers are NULL
-                // Use alternative approach
-                let lua = vref.lua.lock();
-                unsafe { ffi::lua_tostring(lua.ref_thread(), vref.index) as *const c_void }
-            }
             Value::LightUserData(ud) => ud.0,
             Value::Table(Table(vref))
             | Value::Function(Function(vref))
             | Value::Thread(Thread(vref, ..))
             | Value::UserData(AnyUserData(vref))
             | Value::Other(vref) => vref.to_pointer(),
+            Value::String(s) => s.to_pointer(),
             #[cfg(feature = "luau")]
             Value::Buffer(crate::Buffer(vref)) => vref.to_pointer(),
             _ => ptr::null(),
@@ -352,31 +347,6 @@ impl Value {
         }
     }
 
-    /// Cast the value to [`BorrowedStr`].
-    ///
-    /// If the value is a [`LuaString`], try to convert it to [`BorrowedStr`] or return `None`
-    /// otherwise.
-    #[deprecated(
-        since = "0.11.0",
-        note = "This method does not follow Rust naming convention. Use `as_string().and_then(|s| s.to_str().ok())` instead."
-    )]
-    #[inline]
-    pub fn as_str(&self) -> Option<BorrowedStr> {
-        self.as_string().and_then(|s| s.to_str().ok())
-    }
-
-    /// Cast the value to [`String`].
-    ///
-    /// If the value is a [`LuaString`], converts it to [`String`] or returns `None` otherwise.
-    #[deprecated(
-        since = "0.11.0",
-        note = "This method does not follow Rust naming convention. Use `as_string().map(|s| s.to_string_lossy())` instead."
-    )]
-    #[inline]
-    pub fn as_string_lossy(&self) -> Option<String> {
-        self.as_string().map(|s| s.to_string_lossy())
-    }
-
     /// Returns `true` if the value is a Lua [`Table`].
     #[inline]
     pub fn is_table(&self) -> bool {
@@ -445,6 +415,31 @@ impl Value {
         }
     }
 
+    /// Cast the value to a [`Vector`].
+    ///
+    /// If the value is a [`Vector`], returns it or `None` otherwise.
+    ///
+    /// [`Vector`]: crate::Vector
+    #[cfg(any(feature = "luau", doc))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "luau")))]
+    #[inline]
+    pub fn as_vector(&self) -> Option<crate::Vector> {
+        match self {
+            Value::Vector(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// Returns `true` if the value is a [`Vector`].
+    ///
+    /// [`Vector`]: crate::Vector
+    #[cfg(any(feature = "luau", doc))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "luau")))]
+    #[inline]
+    pub fn is_vector(&self) -> bool {
+        self.as_vector().is_some()
+    }
+
     /// Cast the value to a [`Buffer`].
     ///
     /// If the value is [`Buffer`], returns it or `None` otherwise.
@@ -498,14 +493,6 @@ impl Value {
     // Compares two values.
     // Used to sort values for Debug printing.
     pub(crate) fn sort_cmp(&self, other: &Self) -> Ordering {
-        fn cmp_num(a: Number, b: Number) -> Ordering {
-            match (a, b) {
-                _ if a < b => Ordering::Less,
-                _ if a > b => Ordering::Greater,
-                _ => Ordering::Equal,
-            }
-        }
-
         match (self, other) {
             // Nil
             (Value::Nil, Value::Nil) => Ordering::Equal,
@@ -521,9 +508,11 @@ impl Value {
             (_, Value::Boolean(_)) => Ordering::Greater,
             // Integer && Number
             (Value::Integer(a), Value::Integer(b)) => a.cmp(b),
-            (Value::Integer(a), Value::Number(b)) => cmp_num(*a as Number, *b),
-            (Value::Number(a), Value::Integer(b)) => cmp_num(*a, *b as Number),
-            (Value::Number(a), Value::Number(b)) => cmp_num(*a, *b),
+            (Value::Integer(a), Value::Number(b)) => (*a as Number).partial_cmp(b).unwrap_or(Ordering::Equal),
+            (Value::Number(a), Value::Integer(b)) => {
+                a.partial_cmp(&(*b as Number)).unwrap_or(Ordering::Equal)
+            }
+            (Value::Number(a), Value::Number(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
             (Value::Integer(_) | Value::Number(_), _) => Ordering::Less,
             (_, Value::Integer(_) | Value::Number(_)) => Ordering::Greater,
             // Vector (Luau)

@@ -1,18 +1,6 @@
 //! Lua userdata handling.
 //!
 //! This module provides types for creating and working with Lua userdata from Rust.
-//!
-//! # Main Types
-//!
-//! - [`AnyUserData`] - A handle to a Lua userdata value of any Rust type.
-//! - [`UserData`] - Trait to implement for types that should be exposed to Lua as userdata.
-//! - [`UserDataFields`] - Trait for registering fields on userdata types.
-//! - [`UserDataMethods`] - Trait for registering methods on userdata types.
-//! - [`UserDataRegistry`] - Registry for userdata methods and fields.
-//! - [`UserDataMetatable`] - A handle to the metatable of a userdata type.
-//! - [`UserDataRef`] - A borrowed reference to a userdata value.
-//! - [`UserDataRefMut`] - A mutably borrowed reference to a userdata value.
-//! - [`MetaMethod`] - Metamethod names for customizing Lua operators.
 
 use std::any::TypeId;
 use std::ffi::CStr;
@@ -20,6 +8,7 @@ use std::fmt;
 use std::hash::Hash;
 use std::os::raw::{c_char, c_void};
 
+use crate::Either;
 use crate::error::{Error, Result};
 use crate::function::Function;
 use crate::state::Lua;
@@ -41,7 +30,7 @@ use {
 
 // Re-export for convenience
 pub(crate) use cell::UserDataStorage;
-pub use r#ref::{UserDataRef, UserDataRefMut};
+pub use r#ref::{UserDataOwned, UserDataRef, UserDataRefMut};
 pub use registry::UserDataRegistry;
 pub(crate) use registry::{RawUserDataRegistry, UserDataProxy};
 pub(crate) use util::{
@@ -286,8 +275,7 @@ impl MetaMethod {
 
     pub(crate) fn validate(name: &str) -> Result<&str> {
         match name {
-            "__gc" => Err(Error::MetaMethodRestricted(name.to_string())),
-            "__metatable" => Err(Error::MetaMethodRestricted(name.to_string())),
+            "__gc" | "__metatable" => Err(Error::MetaMethodRestricted(name.to_string())),
             _ if name.starts_with("__mlua") => Err(Error::MetaMethodRestricted(name.to_string())),
             name => Ok(name),
         }
@@ -338,9 +326,8 @@ pub trait UserDataMethods<T> {
     /// The userdata `T` will be moved out of the userdata container. This is useful for
     /// methods that need to consume the userdata.
     ///
-    /// The method can be called only once per userdata instance, subsequent calls will result in a
-    /// [`Error::UserDataDestructed`] error.
-    #[doc(hidden)]
+    /// The method can be called only once per userdata instance. A subsequent call returns an
+    /// [`Error::BadArgument`] for `self` whose cause is [`Error::UserDataDestructed`].
     fn add_method_once<M, A, R>(&mut self, name: impl Into<String>, method: M)
     where
         T: 'static,
@@ -391,11 +378,10 @@ pub trait UserDataMethods<T> {
     /// The userdata `T` will be moved out of the userdata container. This is useful for
     /// methods that need to consume the userdata.
     ///
-    /// The method can be called only once per userdata instance, subsequent calls will result in a
-    /// [`Error::UserDataDestructed`] error.
+    /// The method can be called only once per userdata instance. A subsequent call returns an
+    /// [`Error::BadArgument`] for `self` whose cause is [`Error::UserDataDestructed`].
     #[cfg(feature = "async")]
     #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
-    #[doc(hidden)]
     fn add_async_method_once<M, A, MR, R>(&mut self, name: impl Into<String>, method: M)
     where
         T: 'static,
@@ -504,7 +490,10 @@ pub trait UserDataMethods<T> {
     ///
     /// [`add_meta_method_mut`]: UserDataMethods::add_meta_method_mut
     #[cfg(all(feature = "async", not(any(feature = "lua51", feature = "luau"))))]
-    #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(all(feature = "async", not(any(feature = "lua51", feature = "luau")))))
+    )]
     fn add_async_meta_method_mut<M, A, MR, R>(&mut self, name: impl Into<String>, method: M)
     where
         T: 'static,
@@ -936,7 +925,7 @@ impl AnyUserData {
             }
             ffi::lua_rawgeti(state, -1, n as ffi::lua_Integer);
 
-            V::from_lua(lua.pop_value(), lua.lua())
+            V::from_stack(-1, &lua)
         }
     }
 
@@ -1042,8 +1031,8 @@ impl AnyUserData {
 
     /// Returns a type name of this userdata (from a metatable field).
     ///
-    /// If no type name is set, returns `None`.
-    pub fn type_name(&self) -> Result<Option<String>> {
+    /// If no type name is set, returns `userdata`.
+    pub fn type_name(&self) -> Result<LuaString> {
         let lua = self.0.lua.lock();
         let state = lua.state();
         unsafe {
@@ -1060,8 +1049,8 @@ impl AnyUserData {
                 ffi::luaL_getmetafield(state, -1, MetaMethod::Type.as_cstr().as_ptr())
             };
             match name_type {
-                ffi::LUA_TSTRING => Ok(Some(LuaString(lua.pop_ref()).to_str()?.to_owned())),
-                _ => Ok(None),
+                ffi::LUA_TSTRING => Ok(LuaString(lua.pop_ref())),
+                _ => lua.create_string(b"userdata"),
             }
         }
     }
@@ -1077,8 +1066,8 @@ impl AnyUserData {
             return Ok(false);
         }
 
-        if mt.contains_key("__eq")? {
-            return mt.get::<Function>("__eq")?.call((self, other));
+        if let Some(eq) = mt.get::<Option<Function>>("__eq")? {
+            return eq.call((self, other));
         }
 
         Ok(false)
@@ -1093,7 +1082,7 @@ impl AnyUserData {
             // Userdata must be registered and not destructed
             let _ = lua.get_userdata_ref_type_id(&self.0)?;
             let ud = &*get_userdata::<UserDataStorage<()>>(lua.ref_thread(), self.0.index);
-            Ok::<_, Error>((*ud).is_serializable())
+            Ok::<_, Error>(ud.is_serializable())
         };
         is_serializable().unwrap_or(false)
     }
@@ -1122,8 +1111,10 @@ impl AnyUserData {
         match unsafe { self.invoke_tostring_dbg() } {
             Ok(Some(s)) => write!(fmt, "{s}"),
             _ => {
-                let name = self.type_name().ok().flatten();
-                let name = name.as_deref().unwrap_or("userdata");
+                let name = self.type_name().ok();
+                let name = (name.as_ref())
+                    .map(|s| Either::Left(s.display()))
+                    .unwrap_or(Either::Right("userdata"));
                 write!(fmt, "{name}: {:?}", self.to_pointer())
             }
         }

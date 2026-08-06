@@ -523,7 +523,10 @@ impl IntoLua for &str {
 impl IntoLua for Cow<'_, str> {
     #[inline]
     fn into_lua(self, lua: &Lua) -> Result<Value> {
-        Ok(Value::String(lua.create_string(self.as_bytes())?))
+        match self {
+            Cow::Borrowed(s) => s.into_lua(lua),
+            Cow::Owned(s) => s.into_lua(lua),
+        }
     }
 }
 
@@ -585,7 +588,10 @@ impl IntoLua for &CStr {
 impl IntoLua for Cow<'_, CStr> {
     #[inline]
     fn into_lua(self, lua: &Lua) -> Result<Value> {
-        Ok(Value::String(lua.create_string(self.to_bytes())?))
+        match self {
+            Cow::Borrowed(s) => s.into_lua(lua),
+            Cow::Owned(s) => s.into_lua(lua),
+        }
     }
 }
 
@@ -674,6 +680,8 @@ impl IntoLua for &OsStr {
         Ok(Value::String(lua.create_string(self.as_bytes())?))
     }
 
+    // On non-Unix platforms `OsStr` is not guaranteed to be valid Unicode, invalid sequences are
+    // replaced with `U+FFFD` rather than erroring.
     #[cfg(not(unix))]
     #[inline]
     fn into_lua(self, lua: &Lua) -> Result<Value> {
@@ -806,6 +814,13 @@ macro_rules! lua_convert_int {
                         });
                     }
                 }
+                #[cfg(feature = "luau")]
+                if type_id == ffi::LUA_TINTEGER {
+                    let i = ffi::lua_tointeger64(state, idx, std::ptr::null_mut());
+                    return cast(i).ok_or_else(|| {
+                        Error::from_lua_conversion("integer", stringify!($x), "out of range".to_string())
+                    });
+                }
                 // Fallback to default
                 Self::from_lua(lua.stack_value(idx, Some(type_id)), lua.lua())
             }
@@ -889,17 +904,21 @@ where
     fn from_lua(value: Value, _lua: &Lua) -> Result<Self> {
         match value {
             #[cfg(feature = "luau")]
-            #[rustfmt::skip]
-            Value::Vector(v) if N == crate::Vector::SIZE => unsafe {
-                use std::{mem, ptr};
-                let mut arr: [mem::MaybeUninit<T>; N] = mem::MaybeUninit::uninit().assume_init();
-                ptr::write(arr[0].as_mut_ptr() , T::from_lua(Value::Number(v.x() as _), _lua)?);
-                ptr::write(arr[1].as_mut_ptr(), T::from_lua(Value::Number(v.y() as _), _lua)?);
-                ptr::write(arr[2].as_mut_ptr(), T::from_lua(Value::Number(v.z() as _), _lua)?);
+            Value::Vector(v) if N == crate::Vector::SIZE => {
+                use std::mem::MaybeUninit;
+                let x = T::from_lua(Value::Number(v.x() as _), _lua)?;
+                let y = T::from_lua(Value::Number(v.y() as _), _lua)?;
+                let z = T::from_lua(Value::Number(v.z() as _), _lua)?;
                 #[cfg(feature = "luau-vector4")]
-                ptr::write(arr[3].as_mut_ptr(), T::from_lua(Value::Number(v.w() as _), _lua)?);
-                Ok(mem::transmute_copy(&arr))
-            },
+                let w = T::from_lua(Value::Number(v.w() as _), _lua)?;
+                let mut arr: [MaybeUninit<T>; N] = [const { MaybeUninit::uninit() }; N];
+                arr[0].write(x);
+                arr[1].write(y);
+                arr[2].write(z);
+                #[cfg(feature = "luau-vector4")]
+                arr[3].write(w);
+                Ok(arr.map(|e| unsafe { e.assume_init() }))
+            }
             Value::Table(table) => {
                 let vec = table.sequence_values().collect::<Result<Vec<_>>>()?;
                 vec.try_into().map_err(|vec: Vec<T>| {
@@ -1100,36 +1119,23 @@ impl<L: FromLua, R: FromLua> FromLua for Either<L, R> {
     #[inline]
     fn from_lua(value: Value, lua: &Lua) -> Result<Self> {
         let value_type_name = value.type_name();
-        // Try the left type first
-        match L::from_lua(value.clone(), lua) {
-            Ok(l) => Ok(Either::Left(l)),
-            // Try the right type
-            Err(_) => match R::from_lua(value, lua).map(Either::Right) {
-                Ok(r) => Ok(r),
-                Err(_) => Err(Error::from_lua_conversion(
-                    value_type_name,
-                    Self::type_name(),
-                    None,
-                )),
-            },
-        }
+        L::from_lua(value.clone(), lua)
+            .map(Either::Left)
+            .or_else(|_| R::from_lua(value, lua).map(Either::Right))
+            .map_err(|_| Error::from_lua_conversion(value_type_name, Self::type_name(), None))
     }
 
     #[inline]
     unsafe fn from_stack(idx: c_int, lua: &RawLua) -> Result<Self> {
-        match L::from_stack(idx, lua) {
-            Ok(l) => Ok(Either::Left(l)),
-            Err(_) => match R::from_stack(idx, lua).map(Either::Right) {
-                Ok(r) => Ok(r),
-                Err(_) => {
-                    let state = lua.state();
-                    let from_type_name = CStr::from_ptr(ffi::lua_typename(state, ffi::lua_type(state, idx)))
-                        .to_str()
-                        .unwrap_or("unknown");
-                    let err = Error::from_lua_conversion(from_type_name, Self::type_name(), None);
-                    Err(err)
-                }
-            },
-        }
+        L::from_stack(idx, lua)
+            .map(Either::Left)
+            .or_else(|_| R::from_stack(idx, lua).map(Either::Right))
+            .map_err(|_| {
+                let state = lua.state();
+                let from_type_name = CStr::from_ptr(ffi::lua_typename(state, ffi::lua_type(state, idx)))
+                    .to_str()
+                    .unwrap_or("unknown");
+                Error::from_lua_conversion(from_type_name, Self::type_name(), None)
+            })
     }
 }

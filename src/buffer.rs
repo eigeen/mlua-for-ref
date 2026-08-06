@@ -37,6 +37,10 @@ impl Buffer {
     /// Reads given number of bytes from the buffer at the given offset.
     ///
     /// Offset is 0-based.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `offset + N` is greater than the buffer length.
     #[track_caller]
     pub fn read_bytes<const N: usize>(&self, offset: usize) -> [u8; N] {
         let lua = self.0.lua.lock();
@@ -49,6 +53,10 @@ impl Buffer {
     /// Writes given bytes to the buffer at the given offset.
     ///
     /// Offset is 0-based.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `offset + bytes.len()` is greater than the buffer length.
     #[track_caller]
     pub fn write_bytes(&self, offset: usize, bytes: &[u8]) {
         let lua = self.0.lua.lock();
@@ -59,7 +67,7 @@ impl Buffer {
     /// Returns an adaptor implementing [`io::Read`], [`io::Write`] and [`io::Seek`] over the
     /// buffer.
     ///
-    /// Buffer operations are infallible, none of the read/write functions will return a Err.
+    /// Buffer operations are infallible, none of the read/write functions will return an Err.
     pub fn cursor(self) -> impl io::Read + io::Write + io::Seek {
         BufferCursor(self, 0)
     }
